@@ -1,0 +1,100 @@
+# WandB
+wandb/
+
+# Run outputs (logs, pid files, wandb run ids, jsonl train logs)
+runs/
+outputs/
+results/
+artifacts/
+samples/
+checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Checkpoints & weights (large binary files)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.pb
+weights/
+
+# Logs
+*.log
+*.out
+*.err
+*.pid
+nohup.out
+slurm-*.out
+core
+core.*
+/tmp/
+tmp/
+*.prof
+*.trace.json
+*.qdrep
+*.nsys-rep
+
+# Data & cache
+data/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.lmdb
+*.sqlite
+*.sqlite3
+*.parquet
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+.cache/
+huggingface/
+.huggingface/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual env
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Locally cloned upstream reference repository. Keep attribution and links in
+# README.md; do not vendor its nested Git history or generated media assets.
+third_party/drifting_official/

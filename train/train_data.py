@@ -1,0 +1,264 @@
+"""ImageNet DataLoader helpers for drift-model-imagenet."""
+from __future__ import annotations
+
+import os
+import random
+from typing import Iterator, Optional, Tuple
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torchvision import datasets, transforms
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _center_crop(img: Image.Image, size: int) -> Image.Image:
+    """ADM-style center crop."""
+    while min(*img.size) >= 2 * size:
+        img = img.resize(tuple(x // 2 for x in img.size), resample=Image.BOX)
+    scale = size / min(*img.size)
+    img = img.resize(tuple(round(x * scale) for x in img.size), resample=Image.BICUBIC)
+    arr = np.array(img)
+    cy = (arr.shape[0] - size) // 2
+    cx = (arr.shape[1] - size) // 2
+    return Image.fromarray(arr[cy:cy + size, cx:cx + size])
+
+
+class _LatentCacheDataset(datasets.DatasetFolder):
+    """ImageFolder-style dataset that loads pre-encoded VAE latent .pt files."""
+
+    def __init__(self, root: str):
+        super().__init__(root=root, loader=str, extensions=(".pt",))
+
+    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        moments = data["moments"] if torch.rand(1).item() < 0.5 else data["moments_flip"]
+        return np.asarray(moments), target
+
+
+class _NpyFlatLatentDataset(torch.utils.data.Dataset):
+    """Flat-index npy latent cache dataset.
+
+    Expected layout::
+
+        cache_root/
+            imagenet256_features/{idx}.npy   # shape (1, 4, 32, 32) float32
+            imagenet256_labels/{idx}.npy     # shape (1,) int64
+
+    Indices are contiguous integers 0 .. N-1.
+    """
+
+    def __init__(self, cache_root: str):
+        self.feat_dir = os.path.join(cache_root, "imagenet256_features")
+        self.lbl_dir  = os.path.join(cache_root, "imagenet256_labels")
+        if not os.path.isdir(self.feat_dir):
+            raise FileNotFoundError(f"Features dir not found: {self.feat_dir}")
+        if not os.path.isdir(self.lbl_dir):
+            raise FileNotFoundError(f"Labels dir not found: {self.lbl_dir}")
+        # Build sorted index list from feature dir
+        self.indices = sorted(
+            int(f[:-4]) for f in os.listdir(self.feat_dir) if f.endswith(".npy")
+        )
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, item: int):
+        idx = self.indices[item]
+        feat = np.load(os.path.join(self.feat_dir, f"{idx}.npy"))   # (1, 4, 32, 32)
+        lbl  = np.load(os.path.join(self.lbl_dir,  f"{idx}.npy"))   # (1,)
+        feat = feat.squeeze(0)   # (4, 32, 32)
+        label = int(lbl.flat[0])
+        return feat, label
+
+
+def _build_transforms(resolution: int, use_aug: bool, split: str):
+    if use_aug and split == "train":
+        return transforms.Compose([
+            transforms.RandomResizedCrop(resolution, scale=(0.2, 1.0), interpolation=3),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+    return transforms.Compose([
+        transforms.Lambda(lambda img: _center_crop(img, resolution)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+
+
+def _worker_init_fn(worker_id: int, rank: int = 0) -> None:
+    seed = worker_id + rank * 1000
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def create_imagenet_split(
+    *,
+    imagenet_path: str,
+    resolution: int = 256,
+    batch_size: int = 256,
+    split: str = "train",
+    use_aug: bool = False,
+    use_latent: bool = False,
+    use_cache: bool = False,
+    cache_path: str = "",
+    cache_format: str = "pt_imagefolder",   # "pt_imagefolder" | "npy_flat"
+    num_workers: int = 8,
+    prefetch_factor: int = 2,
+    pin_memory: bool = True,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    latent_device: Optional[torch.device | str] = None,
+) -> Tuple[DataLoader, callable, callable]:
+    """Create an ImageNet DataLoader with preprocess/postprocess functions.
+
+    Returns:
+        (loader, preprocess_fn, postprocess_fn)
+        - preprocess_fn: (images, labels) batch → {"images": BCHW, "labels": B}
+        - postprocess_fn: generated latents/pixels → pixel images in [0, 1]
+    """
+    if use_cache:
+        if not cache_path:
+            raise ValueError(
+                "cache_path must be set when use_cache=True. "
+                "Set `cache_path` in config or IMAGENET_CACHE_PATH."
+            )
+        if cache_format == "npy_flat":
+            # Flat-index .npy layout: cache_path/imagenet256_features & imagenet256_labels
+            # (no train/val subdirectory — full train set only)
+            ds = _NpyFlatLatentDataset(cache_root=cache_path)
+        else:
+            split_root = os.path.join(cache_path, split)
+            if not os.path.isdir(split_root):
+                raise FileNotFoundError(
+                    f"Latent cache split not found: {split_root}. "
+                    "Expected cache root with train/ and val/."
+                )
+            ds = _LatentCacheDataset(root=split_root)
+    else:
+        if not imagenet_path:
+            raise ValueError(
+                "imagenet_path must be set when use_cache=False. "
+                "Set `imagenet_path` in config or IMAGENET_PATH."
+            )
+        split_root = os.path.join(imagenet_path, split)
+        if not os.path.isdir(split_root):
+            raise FileNotFoundError(
+                f"ImageNet split not found: {split_root}. "
+                "Set `imagenet_path` (or IMAGENET_PATH) to a directory containing train/ and val/."
+            )
+        tf = _build_transforms(resolution, use_aug=use_aug, split=split)
+        ds = datasets.ImageFolder(root=split_root, transform=tf)
+
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=(split == "train"))
+
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(sampler is None and split == "train"),
+        drop_last=(split == "train"),
+        sampler=sampler,
+        num_workers=num_workers,
+        prefetch_factor=(prefetch_factor if num_workers > 0 else None),
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+        worker_init_fn=lambda wid: _worker_init_fn(wid, rank),
+    )
+
+    if use_latent or use_cache:
+        from vae_imagenet import get_vae_enc_dec
+
+        if use_cache:
+            def preprocess_fn(batch):
+                cached, label = batch
+                if isinstance(cached, np.ndarray):
+                    cached = torch.from_numpy(cached)
+                if isinstance(label, np.ndarray):
+                    label = torch.from_numpy(label)
+                return {"images": cached.float(), "labels": label}
+        else:
+            _enc_state: dict = {}
+
+            def preprocess_fn(batch, device=None):
+                if "enc" not in _enc_state:
+                    _dev = device or latent_device
+                    if _dev is None:
+                        _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    _dev = torch.device(_dev)
+                    _enc_state["enc"], _ = get_vae_enc_dec(_dev)
+                    _enc_state["device"] = _dev
+                images, label = batch
+                if not isinstance(images, torch.Tensor):
+                    images = torch.from_numpy(np.array(images))
+                if isinstance(label, np.ndarray):
+                    label = torch.from_numpy(label)
+                images = images.float().to(_enc_state["device"], non_blocking=True)
+                latents = _enc_state["enc"](images)
+                return {"images": latents, "labels": label}
+
+        _dec_state: dict = {}
+
+        def postprocess_fn(latents: torch.Tensor) -> torch.Tensor:
+            # Decoder parameters are fp32 by default. Cached latents can be fp16,
+            # so align dtype/device before decode to avoid conv dtype mismatch.
+            if _dec_state.get("device") != latents.device or "dec" not in _dec_state:
+                from vae_imagenet import get_vae_enc_dec
+                _, _dec_state["dec"] = get_vae_enc_dec(latents.device)
+                _dec_state["device"] = latents.device
+
+            decode_in = latents.to(
+                device=_dec_state["device"],
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            pixels = _dec_state["dec"](decode_in)
+            return ((pixels + 1) / 2).clamp(0, 1)
+
+        return loader, preprocess_fn, postprocess_fn
+
+    def preprocess_fn(batch):
+        images, label = batch
+        if not isinstance(images, torch.Tensor):
+            images = torch.from_numpy(np.array(images))
+        if isinstance(label, np.ndarray):
+            label = torch.from_numpy(label)
+        return {"images": images.float(), "labels": label}
+
+    def postprocess_fn(images: torch.Tensor) -> torch.Tensor:
+        return ((images + 1) / 2).clamp(0, 1)
+
+    return loader, preprocess_fn, postprocess_fn
+
+
+def infinite_sampler(loader: DataLoader, start_step: int = 0) -> Iterator:
+    """Yield batches indefinitely, skipping the first start_step batches."""
+    epoch = start_step // len(loader)
+    skip  = start_step % len(loader)
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+    while True:
+        for i, batch in enumerate(loader):
+            if skip > 0 and i < skip:
+                continue
+            yield batch
+        skip = 0
+        epoch += 1
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
