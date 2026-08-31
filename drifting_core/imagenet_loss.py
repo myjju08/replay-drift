@@ -185,6 +185,45 @@ def _mean_square_detached(
     return mean.to(dtype=vals.dtype, device=vals.device)
 
 
+def _global_mean_squares_detached_fused(
+    values: Tuple[torch.Tensor, ...],
+    max_chunk_elements: int = 64 * 1024 * 1024,
+) -> Tuple[torch.Tensor, ...]:
+    """Compute exact global mean-squares with one packed collective.
+
+    Reverse drift needs one global force norm for every temperature in
+    ``R_list``. The streaming path performs one all-reduce per temperature to
+    keep only one force tensor resident. The opt-in fused path retains those
+    force tensors, packs each FP64 ``(sum_sq, count)`` pair into one vector, and
+    issues a single all-reduce. Squaring remains FP32 (matching
+    :func:`_mean_square_detached`) while accumulation and counts are FP64.
+    """
+    if not values:
+        return ()
+
+    device = values[0].device
+    packed = torch.empty(len(values) * 2, dtype=torch.float64, device=device)
+    for index, value in enumerate(values):
+        vals = value.detach()
+        if vals.device != device:
+            raise ValueError("all fused force tensors must be on the same device")
+        flat = vals.reshape(-1)
+        sum_sq = torch.zeros((), dtype=torch.float64, device=device)
+        for start in range(0, flat.numel(), max_chunk_elements):
+            chunk = flat[start:start + max_chunk_elements]
+            sum_sq.add_(chunk.square().sum(dtype=torch.float64))
+        packed[2 * index].copy_(sum_sq)
+        packed[2 * index + 1] = float(flat.numel())
+
+    if _dist_ready():
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    means = packed[0::2] / packed[1::2].clamp(min=1.0)
+    return tuple(
+        means[index].to(dtype=value.dtype, device=value.device)
+        for index, value in enumerate(values)
+    )
+
+
 def _ratio_of_means(
     numerator: torch.Tensor,
     denominator: torch.Tensor,
@@ -716,13 +755,20 @@ def drift_loss_imagenet(
     kernel_temperature_mix_weights: Tuple[float, ...] = (),
     historical_gen: Optional[torch.Tensor] = None,  # [B, C_h, S], detached replay
     weight_history: Optional[torch.Tensor] = None,  # [B, C_h]
+    collect_diagnostics: bool = True,
+    fuse_fnorm_across_R: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Official drift loss (ImageNet version) ported from JAX to PyTorch.
 
     Returns:
         loss:  Per-batch loss tensor [B] (same interface as official JAX code).
-        info:  dict with 'scale' and 'loss_{R}' (scalar stats for logging).
+        info:  dict with 'scale' and 'loss_{R}' scalar logging stats when
+               ``collect_diagnostics`` is enabled.
+
+    ``fuse_fnorm_across_R`` trades VRAM for fewer distributed collectives: all
+    per-temperature force tensors remain resident until their FP64 sum-square
+    and count pairs can be reduced in one packed vector.
     """
     B, C_g, S = gen.shape
     C_p = fixed_pos.shape[1]
@@ -862,16 +908,26 @@ def drift_loss_imagenet(
         )
     dist_normed = dist_normed_clean + block_mask * 100.0
 
-    info: Dict[str, float] = {"scale": float(scale.item())}
-    if C_h > 0:
-        info["history/count"] = float(C_h)
-        info["history/current_mass"] = float(weight_gen.sum(dim=1).mean().item())
-        info["history/replay_mass"] = float(weight_history.sum(dim=1).mean().item())
-    if local_bandwidth is not None:
-        info["kernel_bandwidth_mean"] = float(local_bandwidth.mean().item())
+    info: Dict[str, float] = {}
+    if collect_diagnostics:
+        info["scale"] = float(scale.item())
+        if C_h > 0:
+            info["history/count"] = float(C_h)
+            info["history/current_mass"] = float(
+                weight_gen.sum(dim=1).mean().item()
+            )
+            info["history/replay_mass"] = float(
+                weight_history.sum(dim=1).mean().item()
+            )
+        if local_bandwidth is not None:
+            info["kernel_bandwidth_mean"] = float(
+                local_bandwidth.mean().item()
+            )
     old_gen_scaled_goal = old_gen_scaled
     scale_inputs_goal = scale_inputs
     force_across_R = torch.zeros_like(old_gen_scaled_goal)
+    fuse_global_fnorm = bool(fuse_fnorm_across_R) and global_fnorm_stats
+    forces_pending_fnorm = []
 
     for R in R_list:
         affinity = _reverse_mutual_affinity(
@@ -910,7 +966,7 @@ def drift_loss_imagenet(
         sum_neg = aff_neg.sum(dim=2, keepdim=True)           # [B, C_g, 1]
         r_coeff_pos = aff_pos * sum_neg                      # attract toward pos
 
-        if compute_wpos_stats and R == R_list[0]:
+        if collect_diagnostics and compute_wpos_stats and R == R_list[0]:
             with torch.no_grad():
                 info.update(
                     _wpos_stats_from_matrix(
@@ -963,11 +1019,32 @@ def drift_loss_imagenet(
         )
         total_force_R.div_(scale_inputs)
 
-        f_norm_val = _mean_square_detached(total_force_R, use_global_stats=global_fnorm_stats)
-        info[f"loss_{R}"] = float(f_norm_val.item())
+        if fuse_global_fnorm:
+            forces_pending_fnorm.append(total_force_R)
+        else:
+            f_norm_val = _mean_square_detached(
+                total_force_R,
+                use_global_stats=global_fnorm_stats,
+            )
+            if collect_diagnostics:
+                info[f"loss_{R}"] = float(f_norm_val.item())
 
-        force_scale = f_norm_val.clamp(min=1e-8).sqrt()
-        force_across_R = force_across_R + total_force_R / force_scale
+            force_scale = f_norm_val.clamp(min=1e-8).sqrt()
+            force_across_R = force_across_R + total_force_R / force_scale
+
+    if forces_pending_fnorm:
+        fused_fnorm_values = _global_mean_squares_detached_fused(
+            tuple(forces_pending_fnorm)
+        )
+        for R, total_force_R, f_norm_val in zip(
+            R_list,
+            forces_pending_fnorm,
+            fused_fnorm_values,
+        ):
+            if collect_diagnostics:
+                info[f"loss_{R}"] = float(f_norm_val.item())
+            force_scale = f_norm_val.clamp(min=1e-8).sqrt()
+            force_across_R = force_across_R + total_force_R / force_scale
 
     force_multiplier_f = float(force_multiplier)
     if not math.isfinite(force_multiplier_f) or force_multiplier_f < 0.0:
@@ -976,7 +1053,8 @@ def drift_loss_imagenet(
         )
     if force_multiplier_f != 1.0:
         force_across_R.mul_(force_multiplier_f)
-    info["force_multiplier"] = force_multiplier_f
+    if collect_diagnostics:
+        info["force_multiplier"] = force_multiplier_f
     goal_scaled = (old_gen_scaled_goal + force_across_R).detach()
     gen_scaled = gen / scale_inputs_goal
     diff = gen_scaled - goal_scaled

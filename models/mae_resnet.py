@@ -182,25 +182,37 @@ class _ResNetEncoder(nn.Module):
         x: torch.Tensor,
         return_block_outputs: bool = False,
         use_remat: bool = False,
+        capture_stages: Optional[Tuple[str, ...]] = None,
+        block_output_stages: Optional[Tuple[str, ...]] = None,
     ) -> Dict[str, torch.Tensor] | Tuple[Dict, Dict]:
+        all_stages = tuple(f"stage{i}" for i in range(1, 5))
+        captured = set(all_stages if capture_stages is None else capture_stages)
+        captured_blocks = set(
+            captured if block_output_stages is None else block_output_stages
+        )
         feats: Dict[str, torch.Tensor] = {}
         block_outs: Dict[str, List[torch.Tensor]] = {}
 
         x = F.relu(self.gn1(self.conv1(x)))
-        feats["conv1"] = x
+        if "stage1" in captured:
+            feats["conv1"] = x
 
         for i, stage in enumerate(self.stages):
             lname = f"layer{i+1}"
-            outs = []
+            stage_name = f"stage{i+1}"
+            outs = [] if return_block_outputs and stage_name in captured_blocks else None
             for block in stage:
                 if use_remat and torch.is_grad_enabled() and x.requires_grad:
                     x = checkpoint(block, x, use_reentrant=False)
                 else:
                     x = block(x)
-                outs.append(x)
-            block_outs[lname] = outs
+                if outs is not None:
+                    outs.append(x)
+            if outs is not None:
+                block_outs[lname] = outs
             x = getattr(self, f"{lname}_norm")(x)
-            feats[lname] = x
+            if stage_name in captured:
+                feats[lname] = x
 
         if return_block_outputs:
             return feats, block_outs
@@ -405,6 +417,7 @@ class MAEResNet(nn.Module):
         every_k_block: float = 2,
         stage_adapters: Optional[nn.ModuleDict] = None,
         return_stage_features: bool = False,
+        active_stages: Optional[List[str]] = None,
     ) -> Dict[str, torch.Tensor] | Tuple[
         Dict[str, torch.Tensor], Dict[str, torch.Tensor]
     ]:
@@ -420,6 +433,22 @@ class MAEResNet(nn.Module):
             patch_mean_size = [2, 4]
         if patch_std_size is None:
             patch_std_size = [2, 4]
+
+        valid_stages = tuple(f"stage{i}" for i in range(1, 5))
+        if active_stages is None:
+            selected_stages = valid_stages
+        else:
+            requested_stages = {str(stage).strip() for stage in active_stages}
+            unknown_stages = requested_stages.difference(valid_stages)
+            if unknown_stages:
+                raise ValueError(
+                    f"Unknown active feature stages: {sorted(unknown_stages)}; "
+                    f"expected a subset of {list(valid_stages)}"
+                )
+            selected_stages = tuple(
+                stage for stage in valid_stages if stage in requested_stages
+            )
+        selected_stage_set = set(selected_stages)
 
         out: Dict[str, torch.Tensor] = {}
         adapter_inputs: Dict[str, torch.Tensor] = {}
@@ -443,9 +472,15 @@ class MAEResNet(nn.Module):
                 x,
                 return_block_outputs=True,
                 use_remat=self.use_remat,
+                capture_stages=None if return_stage_features else selected_stages,
+                block_output_stages=selected_stages,
             )
         else:
-            feats = self.encoder(x, use_remat=self.use_remat)
+            feats = self.encoder(
+                x,
+                use_remat=self.use_remat,
+                capture_stages=None if return_stage_features else selected_stages,
+            )
             block_outs = {}
 
         # Match official behavior: norm_x is computed on patched input.
@@ -459,6 +494,8 @@ class MAEResNet(nn.Module):
                 if name == prefix or name.startswith(f"{prefix}_"):
                     stage = f"stage{stage_index}"
                     break
+            if stage is not None and stage not in selected_stage_set:
+                return
             if stage_adapters is not None and stage in stage_adapters:
                 feat = stage_adapters[stage](feat)
             # feat: (B, C, H, W) → tokens (B, H*W, C)

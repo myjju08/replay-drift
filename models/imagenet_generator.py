@@ -85,20 +85,45 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
 
 
+def _build_rope_cache(
+    sequence_length: int,
+    head_dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create graph-free RoPE cos/sin tables for a sequence shape."""
+    half = head_dim // 2
+    with torch.no_grad():
+        freqs = 1.0 / (
+            10000
+            ** (torch.arange(half, device=device, dtype=dtype) / half)
+        )
+        positions = torch.arange(sequence_length, device=device, dtype=dtype)
+        freqs = torch.outer(positions, freqs)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = emb.cos()[None, :, None, :]
+        sin = emb.sin()[None, :, None, :]
+    return cos, sin
+
+
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     rope_dtype: torch.dtype = torch.float32,
+    rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """RoPE for q, k: (B, N, H, D)."""
-    B, N, H, D = q.shape
-    half = D // 2
-    freqs = 1.0 / (10000 ** (torch.arange(half, device=q.device, dtype=rope_dtype) / half))
-    t = torch.arange(N, device=q.device, dtype=rope_dtype)
-    freqs = torch.outer(t, freqs)
-    emb = torch.cat([freqs, freqs], dim=-1)          # (N, D)
-    cos = emb.cos()[None, :, None, :]                 # (1, N, 1, D)
-    sin = emb.sin()[None, :, None, :]
+    _, N, _, D = q.shape
+    if rope_cache is None:
+        cos, sin = _build_rope_cache(
+            N,
+            D,
+            device=q.device,
+            dtype=rope_dtype,
+        )
+    else:
+        cos, sin = rope_cache
     q_out = q * cos + rotate_half(q) * sin
     k_out = k * cos + rotate_half(k) * sin
     return q_out, k_out
@@ -117,6 +142,7 @@ class Attention(nn.Module):
         use_rope: bool = False,
         use_rmsnorm: bool = True,
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -124,6 +150,14 @@ class Attention(nn.Module):
         self.scale     = self.head_dim ** -0.5
         self.use_rope  = use_rope
         self.attn_fp32 = attn_fp32
+        self.use_sdpa  = use_sdpa
+        # Plain tensor attributes intentionally stay out of state_dict and DDP
+        # buffer broadcasts. _apply clears them on device/dtype transitions.
+        self._rope_cache_key: Optional[
+            Tuple[str, Optional[int], torch.dtype, int, int]
+        ] = None
+        self._rope_cos_cache: Optional[torch.Tensor] = None
+        self._rope_sin_cache: Optional[torch.Tensor] = None
 
         self.qkv  = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
@@ -137,6 +171,56 @@ class Attention(nn.Module):
         else:
             self.q_norm = self.k_norm = nn.Identity()
 
+    def _clear_rope_cache(self) -> None:
+        self._rope_cache_key = None
+        self._rope_cos_cache = None
+        self._rope_sin_cache = None
+
+    def _apply(self, fn: Any, *args: Any, **kwargs: Any) -> "Attention":
+        module = super()._apply(fn, *args, **kwargs)
+        self._clear_rope_cache()
+        return module
+
+    def _get_rope_cache(
+        self,
+        q: torch.Tensor,
+        rope_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sequence_length = q.shape[1]
+        head_dim = q.shape[-1]
+        key = (
+            q.device.type,
+            q.device.index,
+            rope_dtype,
+            sequence_length,
+            head_dim,
+        )
+        expected_shape = (1, sequence_length, 1, head_dim)
+        cos = self._rope_cos_cache
+        sin = self._rope_sin_cache
+        cache_is_valid = (
+            self._rope_cache_key == key
+            and cos is not None
+            and sin is not None
+            and cos.device == q.device
+            and sin.device == q.device
+            and cos.dtype == rope_dtype
+            and sin.dtype == rope_dtype
+            and tuple(cos.shape) == expected_shape
+            and tuple(sin.shape) == expected_shape
+        )
+        if not cache_is_valid:
+            cos, sin = _build_rope_cache(
+                sequence_length,
+                head_dim,
+                device=q.device,
+                dtype=rope_dtype,
+            )
+            self._rope_cache_key = key
+            self._rope_cos_cache = cos
+            self._rope_sin_cache = sin
+        return cos, sin
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
@@ -147,7 +231,13 @@ class Attention(nn.Module):
 
         if self.use_rope:
             rope_dtype = torch.float32 if self.attn_fp32 else q.dtype
-            q, k = apply_rope(q, k, rope_dtype=rope_dtype)
+            rope_cache = self._get_rope_cache(q, rope_dtype)
+            q, k = apply_rope(
+                q,
+                k,
+                rope_dtype=rope_dtype,
+                rope_cache=rope_cache,
+            )
 
         if self.attn_fp32:
             q = q.transpose(1, 2).float() * self.scale  # (B, H, N, D)
@@ -158,8 +248,21 @@ class Attention(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
-        out  = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        if self.use_sdpa:
+            # q already carries head_dim**-0.5, so disable SDPA's default scale.
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,
+            )
+        else:
+            attn = (q @ k.transpose(-2, -1)).softmax(dim=-1)
+            out = attn @ v
+        out = out.transpose(1, 2).reshape(B, N, C)
         return self.proj(out.to(x.dtype))
 
 
@@ -174,12 +277,21 @@ class LightningDiTBlock(nn.Module):
         use_rope: bool = True,
         use_rmsnorm: bool = True,
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size) if use_rmsnorm else nn.LayerNorm(hidden_size, elementwise_affine=False)
         self.norm2 = RMSNorm(hidden_size) if use_rmsnorm else nn.LayerNorm(hidden_size, elementwise_affine=False)
 
-        self.attn = Attention(hidden_size, num_heads, use_qk_norm, use_rope, use_rmsnorm, attn_fp32=attn_fp32)
+        self.attn = Attention(
+            hidden_size,
+            num_heads,
+            use_qk_norm,
+            use_rope,
+            use_rmsnorm,
+            attn_fp32=attn_fp32,
+            use_sdpa=use_sdpa,
+        )
 
         mlp_hidden = int(hidden_size * mlp_ratio)
         if use_swiglu:
@@ -286,6 +398,7 @@ class LightningDiT(nn.Module):
         n_cls_tokens: int = 0,
         use_remat: bool = False,       # gradient checkpointing
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.patch_size   = patch_size
@@ -311,7 +424,17 @@ class LightningDiT(nn.Module):
             nn.init.normal_(self.cls_embed, std=0.02)
 
         self.blocks = nn.ModuleList([
-            LightningDiTBlock(hidden_size, num_heads, mlp_ratio, use_qk_norm, use_swiglu, use_rope, use_rmsnorm, attn_fp32=attn_fp32)
+            LightningDiTBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio,
+                use_qk_norm,
+                use_swiglu,
+                use_rope,
+                use_rmsnorm,
+                attn_fp32=attn_fp32,
+                use_sdpa=use_sdpa,
+            )
             for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, out_channels, use_rmsnorm)
@@ -398,6 +521,7 @@ class DitGen(nn.Module):
         use_bf16: bool = True,
         use_remat: bool = False,
         attn_fp32: bool = True,
+        use_sdpa: bool = False,
     ):
         super().__init__()
         self.cond_dim    = cond_dim
@@ -440,6 +564,7 @@ class DitGen(nn.Module):
             n_cls_tokens=n_cls_tokens,
             use_remat=use_remat,
             attn_fp32=attn_fp32,
+            use_sdpa=use_sdpa,
         )
 
     def _build_cond(

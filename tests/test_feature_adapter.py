@@ -114,6 +114,47 @@ class FeatureAdapterTest(unittest.TestCase):
                 baseline[key], adapted[key], rtol=0.0, atol=0.0
             )
 
+    def test_mae_active_stages_omit_early_feature_computation(self):
+        mae = MAEResNet(
+            num_classes=10,
+            in_channels=4,
+            base_channels=8,
+            layers=(2, 2, 2, 2),
+            use_bf16=False,
+            input_patch_size=1,
+        ).eval()
+        activations = mae.get_activations(
+            torch.randn(2, 4, 8, 8),
+            patch_mean_size=[2],
+            patch_std_size=[2],
+            use_mean=True,
+            use_std=True,
+            with_global=True,
+            every_k_block=1,
+            active_stages=["stage3", "stage4"],
+        )
+
+        self.assertIn("global", activations)
+        self.assertIn("norm_x", activations)
+        self.assertTrue(any(name.startswith("layer3") for name in activations))
+        self.assertTrue(any(name.startswith("layer4") for name in activations))
+        self.assertFalse(
+            any(
+                name == "conv1"
+                or name.startswith("conv1_")
+                or name == "layer1"
+                or name.startswith("layer1_")
+                or name == "layer2"
+                or name.startswith("layer2_")
+                for name in activations
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "Unknown active feature stages"):
+            mae.get_activations(
+                torch.randn(1, 4, 8, 8), active_stages=["stage5"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

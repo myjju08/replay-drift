@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#SBATCH --account=osilab
+#SBATCH --qos=normal
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:a6000:2
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
+#SBATCH --time=3-00:00:00
+#SBATCH --requeue
+#SBATCH --output=/shared/juhyeong/I-Drift/logs/%x-%j.out
+#SBATCH --error=/shared/juhyeong/I-Drift/logs/%x-%j.err
+#SBATCH --open-mode=append
+
+set -euo pipefail
+
+: "${CONFIG_BASENAME:?Set CONFIG_BASENAME to one of the S4 YAML filenames}"
+: "${RUN_NAME:?Set RUN_NAME to a new, unique run directory name}"
+
+CODE_ROOT="/shared/juhyeong/I-Drift"
+DATA_ROOT="${IDRIFT_DATA_ROOT:-${CODE_ROOT}/data/imagenet}"
+CONFIG_PATH="${CODE_ROOT}/configs/gen/${CONFIG_BASENAME}"
+WORKDIR="${CODE_ROOT}/runs/${RUN_NAME}"
+MAE_CHECKPOINT="${DATA_ROOT}/mae_latent_256/ckpt_latest.pt"
+CACHE_PATH="${IDRIFT_CACHE_PATH:-${DATA_ROOT}/latent_cache_256}"
+
+PYTHON="${IDRIFT_PYTHON:-/shared/juhyeong/.venvs/idrift/bin/python}"
+
+for required in \
+  "${CODE_ROOT}/train_imagenet_gen.py" \
+  "${CONFIG_PATH}" \
+  "${MAE_CHECKPOINT}" \
+  "${CACHE_PATH}/train" \
+  "${CACHE_PATH}/val" \
+  "${PYTHON}"; do
+  if [[ ! -e "${required}" ]]; then
+    echo "Missing required path: ${required}" >&2
+    exit 2
+  fi
+done
+
+"${PYTHON}" - <<'PY'
+import torch_fidelity  # noqa: F401
+import torchmetrics  # noqa: F401
+PY
+
+# Fail before allocating a run directory if a matched S/4 pre-opt job was
+# accidentally pointed at an optimized model path or early-stage features.
+IDRIFT_CONFIG_PATH="${CONFIG_PATH}" \
+IDRIFT_EXPECTED_CACHE_PATH="${CACHE_PATH}" \
+"${PYTHON}" - <<'PY'
+import os
+import sys
+
+code_root = "/shared/juhyeong/I-Drift"
+sys.path.insert(0, code_root)
+from train_imagenet_gen import load_yaml_config
+
+cfg = load_yaml_config(os.environ["IDRIFT_CONFIG_PATH"])
+raw = cfg["_raw"]
+expected = {
+    "batch_size": 4,
+    "pos_per_sample": 32,
+    "neg_per_sample": 32,
+    "gen_per_label": 32,
+    "throughput_opt_level": 3,
+}
+for key, value in expected.items():
+    if cfg.get(key) != value:
+        raise SystemExit(f"pre-opt S/4 preflight failed: {key}={cfg.get(key)!r}, expected {value!r}")
+model = raw["model"]
+for key, value in {
+    "hidden_size": 384,
+    "depth": 12,
+    "num_heads": 6,
+    "patch_size": 4,
+    "use_sdpa": False,
+    "use_remat": False,
+}.items():
+    if model.get(key) != value:
+        raise SystemExit(f"pre-opt S/4 preflight failed: model.{key}={model.get(key)!r}, expected {value!r}")
+if cfg.get("allow_tf32", False) or cfg.get("cudnn_benchmark", False):
+    raise SystemExit("pre-opt S/4 preflight failed: TF32/cuDNN benchmark must be disabled")
+if list(cfg.get("activation_kwargs", {}).get("active_stages", [])) != ["stage3", "stage4"]:
+    raise SystemExit("pre-opt S/4 preflight failed: active_stages must be [stage3, stage4]")
+profile = cfg.get("feature_loss_profiles", {}).get(cfg.get("feature_loss_profile"), {})
+if float(profile.get("stage1", 1.0)) != 0.0 or float(profile.get("stage2", 1.0)) != 0.0:
+    raise SystemExit("pre-opt S/4 preflight failed: stage1/stage2 loss weights must both be zero")
+if not bool(cfg.get("prune_skipped_feature_tensors", False)):
+    raise SystemExit("pre-opt S/4 preflight failed: skipped feature tensors must be pruned")
+if cfg.get("cache_path") != os.environ["IDRIFT_EXPECTED_CACHE_PATH"]:
+    raise SystemExit(
+        f"cache mismatch: config={cfg.get('cache_path')!r}, "
+        f"launcher={os.environ['IDRIFT_EXPECTED_CACHE_PATH']!r}"
+    )
+if not bool(cfg.get("use_wandb", False)):
+    raise SystemExit("pre-opt S/4 preflight failed: W&B logging is disabled")
+print(
+    "[preflight] matched S/4 pre-opt: B4 P32 N32 G32, manual attention, "
+    "TF32=false, cuDNN benchmark=false, drift features=stage3+stage4, W&B=true",
+    flush=True,
+)
+PY
+
+# Require the reviewed DDP synchronization and active-stage feature extraction
+# changes, and reject any other tracked source change.
+EXPECTED_TRACKED_CHANGES=(
+  "drifting_core/imagenet_loss.py"
+  "models/imagenet_generator.py"
+  "models/mae_resnet.py"
+  "tests/test_feature_adapter.py"
+  "train_imagenet_gen.py"
+)
+mapfile -t TRACKED_CHANGES < <(git -C "${CODE_ROOT}" diff --name-only)
+if [[ "${TRACKED_CHANGES[*]}" != "${EXPECTED_TRACKED_CHANGES[*]}" ]]; then
+  echo "Unexpected tracked changes in I-Drift." >&2
+  git -C "${CODE_ROOT}" status --short >&2
+  exit 2
+fi
+if ! grep -Fq 'out = generator(expanded_labels, cfg_scale=expanded_cfg, train=True)' \
+  "${CODE_ROOT}/train_imagenet_gen.py"; then
+  echo "Required DDP synchronization fix is missing." >&2
+  exit 2
+fi
+EXPECTED_SOURCE_DIFF_SHA256="3e63f8bdca946e9b55d5eb5d3d0b97fe13083979d375c8bc5b3c8c966baafc97"
+ACTUAL_SOURCE_DIFF_SHA256="$(git -C "${CODE_ROOT}" diff -- "${EXPECTED_TRACKED_CHANGES[@]}" | sha256sum | awk '{print $1}')"
+if [[ "${ACTUAL_SOURCE_DIFF_SHA256}" != "${EXPECTED_SOURCE_DIFF_SHA256}" ]]; then
+  echo "The I-Drift source diff is not the reviewed S4 training patch." >&2
+  exit 2
+fi
+
+mkdir -p "${WORKDIR}" "${CODE_ROOT}/logs" "${CODE_ROOT}/wandb"
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG=WARN
+export TORCH_HOME="${IDRIFT_TORCH_HOME:-/shared/juhyeong/.cache/torch}"
+export HF_HOME="${IDRIFT_HF_HOME:-/shared/juhyeong/.cache/huggingface}"
+if [[ "$(hostname -s)" == "srv04" ]]; then
+  export NCCL_RAS_ENABLE=0
+  export NCCL_P2P_DISABLE=1
+fi
+export WANDB_DIR="${CODE_ROOT}/wandb"
+
+echo "[launch] job=${SLURM_JOB_ID} node=$(hostname) config=${CONFIG_PATH}"
+echo "[launch] run=${RUN_NAME} workdir=${WORKDIR} source_head=$(git -C "${CODE_ROOT}" rev-parse HEAD)"
+echo "[launch] data_root=${DATA_ROOT}"
+echo "[launch] cache_path=${CACHE_PATH}"
+echo "[launch] visible_gpus=${CUDA_VISIBLE_DEVICES:-unset} job_gpus=${SLURM_JOB_GPUS:-unknown}"
+echo "[launch] config_sha256=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')"
+
+cd "${CODE_ROOT}"
+TRAIN_ARGS=()
+if [[ -n "${THROUGHPUT_OPT_LEVEL_OVERRIDE:-}" ]]; then
+  TRAIN_ARGS+=(--throughput_opt_level "${THROUGHPUT_OPT_LEVEL_OVERRIDE}")
+fi
+if [[ -n "${MAX_STEPS:-}" ]]; then
+  TRAIN_ARGS+=(--max_steps "${MAX_STEPS}")
+fi
+exec "${PYTHON}" -m torch.distributed.run --standalone --nproc_per_node=2 \
+  "${CODE_ROOT}/train_imagenet_gen.py" \
+  --config "${CONFIG_PATH}" \
+  --workdir "${WORKDIR}" \
+  "${TRAIN_ARGS[@]}"

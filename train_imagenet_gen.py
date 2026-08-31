@@ -67,6 +67,77 @@ def _ddp_mean_scalar(value: torch.Tensor | float, device: torch.device) -> float
     return float(scalar.cpu().item())
 
 
+def _configure_level4_cuda_runtime(
+    cfg: dict,
+    throughput_opt_level: int,
+    device: torch.device,
+) -> None:
+    """Enable opt-level-4 CUDA math/autotuning knobs without changing lower levels."""
+    if int(throughput_opt_level) < 4 or device.type != "cuda":
+        return
+
+    allow_tf32 = bool(cfg.get("allow_tf32", True))
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    if allow_tf32:
+        torch.set_float32_matmul_precision("high")
+
+    cudnn_benchmark = bool(cfg.get("cudnn_benchmark", True))
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    if cudnn_benchmark and hasattr(torch.backends.cudnn, "benchmark_limit"):
+        torch.backends.cudnn.benchmark_limit = int(
+            cfg.get("cudnn_benchmark_limit", 10)
+        )
+
+
+def _collect_mix_alpha_stats_this_step(
+    *,
+    throughput_opt_level: int,
+    collect_diagnostics: bool,
+    drift_matching: str,
+) -> bool:
+    """Whether raw winner stats/tracker updates are needed on this step.
+
+    Fixed reverse/forward objectives never consume MixAlphaTracker state. At
+    level 4 their winner computation and tracker collective are diagnostics
+    only, so they follow the diagnostic cadence. Dual drift keeps its prior
+    every-step behavior, including the adaptive state transition.
+    """
+    fixed_matching = str(drift_matching).lower().strip() in (
+        "rev-drift",
+        "fwd-drift",
+    )
+    return not (
+        int(throughput_opt_level) >= 4
+        and fixed_matching
+        and not collect_diagnostics
+    )
+
+
+def _collect_training_metrics_this_step(
+    *,
+    throughput_opt_level: int,
+    step: int,
+    log_every_k: int,
+) -> bool:
+    """Gate logging-only CUDA syncs/all-reduces on level-4 non-log steps."""
+    return (
+        int(throughput_opt_level) < 4
+        or int(step) % max(1, int(log_every_k)) == 0
+    )
+
+
+def _zero_generator_grad(
+    optimizer: torch.optim.Optimizer,
+    throughput_opt_level: int,
+) -> None:
+    """Use gradient deallocation only in the level-4 runtime stack."""
+    if int(throughput_opt_level) >= 4:
+        optimizer.zero_grad(set_to_none=True)
+    else:
+        optimizer.zero_grad()
+
+
 def _stochastic_round(x):
     """Stochastic rounding: floor(x) w.p. (1-frac), ceil(x) w.p. frac, frac=x-floor(x).
 
@@ -218,12 +289,14 @@ def _feature_loss_weights_for_groups(
     group_weights: Dict[str, float],
     *,
     normalize: bool,
+    normalization_reference_count: Optional[int] = None,
 ) -> Dict[str, float]:
     """Expand group coefficients to features, optionally preserving mass.
 
-    Mass normalization keeps ``sum(feature weights) == feature count``. This
-    prevents a leave-one-stage-out run from silently reducing the mean loss
-    coefficient merely because that stage emits many derived objectives.
+    Mass normalization normally keeps ``sum(feature weights) == feature
+    count``. ``normalization_reference_count`` can preserve the coefficient
+    mass of a larger reference feature set when inactive stages are omitted
+    before activation materialization.
     """
     names = tuple(feature_names)
     default = float(group_weights.get("default", 1.0))
@@ -238,7 +311,14 @@ def _feature_loss_weights_for_groups(
             raise ValueError(
                 "feature_loss_group_normalize requires at least one active feature"
             )
-        scale = len(weights) / coefficient_mass
+        target_mass = len(weights)
+        if normalization_reference_count is not None:
+            target_mass = int(normalization_reference_count)
+            if target_mass <= 0:
+                raise ValueError(
+                    "feature_loss_normalization_reference_count must be positive"
+                )
+        scale = target_mass / coefficient_mass
         weights = {name: value * scale for name, value in weights.items()}
     return weights
 
@@ -711,6 +791,158 @@ def _crosses_generated_epoch_interval(
     )
 
 
+def _generated_epoch_index(
+    *,
+    completed_steps: int,
+    generated_per_step: int,
+    dataset_size: int,
+) -> int:
+    """Zero-based generated epoch containing the next training step."""
+    if completed_steps < 0:
+        raise ValueError(
+            f"completed_steps must be non-negative, got {completed_steps}"
+        )
+    if generated_per_step <= 0:
+        raise ValueError(
+            f"generated_per_step must be positive, got {generated_per_step}"
+        )
+    if dataset_size <= 0:
+        raise ValueError(f"dataset_size must be positive, got {dataset_size}")
+    return int(
+        (int(completed_steps) * int(generated_per_step)) // int(dataset_size)
+    )
+
+
+def _rolling_replay_target_epoch(
+    *,
+    completed_steps: int,
+    generated_per_step: int,
+    dataset_size: int,
+    lag_epochs: int,
+) -> Optional[int]:
+    """Return the exact integer-epoch snapshot used by lagged replay.
+
+    A run in generated epoch 24 with ``lag_epochs=10`` therefore reads the
+    snapshot collected in generated epoch 14. Before epoch 10 there is no
+    eligible historical target.
+    """
+    if int(lag_epochs) <= 0:
+        raise ValueError(f"lag_epochs must be positive, got {lag_epochs}")
+    current_epoch = _generated_epoch_index(
+        completed_steps=completed_steps,
+        generated_per_step=generated_per_step,
+        dataset_size=dataset_size,
+    )
+    target_epoch = current_epoch - int(lag_epochs)
+    return target_epoch if target_epoch >= 0 else None
+
+
+def _rolling_snapshot_epoch_after_step(
+    *,
+    step: int,
+    generated_per_step: int,
+    dataset_size: int,
+) -> Optional[int]:
+    """Epoch bucket to freeze after ``step`` crosses an integer boundary."""
+    before = _generated_epoch_index(
+        completed_steps=step,
+        generated_per_step=generated_per_step,
+        dataset_size=dataset_size,
+    )
+    after = _generated_epoch_index(
+        completed_steps=step + 1,
+        generated_per_step=generated_per_step,
+        dataset_size=dataset_size,
+    )
+    if after <= before:
+        return None
+    return after - 1
+
+
+def _rolling_replay_snapshot_path(
+    workdir: str | Path,
+    *,
+    rank: int,
+    epoch: int,
+) -> Path:
+    if int(epoch) < 0:
+        raise ValueError(f"epoch must be non-negative, got {epoch}")
+    return (
+        Path(workdir)
+        / f"historical_gen_replay_epoch{int(epoch):04d}_rank{int(rank):02d}.npz"
+    )
+
+
+def _rolling_replay_capture_path(
+    workdir: str | Path,
+    *,
+    rank: int,
+    step: int,
+) -> Path:
+    if int(step) <= 0:
+        raise ValueError(f"step must be positive, got {step}")
+    return (
+        Path(workdir)
+        / f"historical_gen_replay_capture_step{int(step):07d}_rank{int(rank):02d}.npz"
+    )
+
+
+def _rolling_replay_metadata(
+    *,
+    kind: str,
+    rank: int,
+    world_size: int,
+    num_classes: int,
+    bank_count: int,
+    storage_dtype: str,
+    lag_epochs: int,
+    dataset_size: int,
+    generated_per_step: int,
+    epoch: Optional[int] = None,
+    step: Optional[int] = None,
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "kind": str(kind),
+        "rank": int(rank),
+        "world_size": int(world_size),
+        "num_classes": int(num_classes),
+        "bank_count": int(bank_count),
+        "storage_dtype": str(storage_dtype),
+        "lag_epochs": int(lag_epochs),
+        "dataset_size": int(dataset_size),
+        "generated_per_step": int(generated_per_step),
+    }
+    if epoch is not None:
+        metadata["epoch"] = int(epoch)
+    if step is not None:
+        metadata["step"] = int(step)
+    return metadata
+
+
+def _save_rolling_epoch_snapshot_and_reset(
+    capture_bank: ArrayMemoryBank,
+    path: str | Path,
+    *,
+    metadata: Dict[str, Any],
+    min_per_class: int,
+) -> ArrayMemoryBank:
+    """Freeze one epoch-local bank and return a fresh capture bank."""
+    if not capture_bank.is_ready(min_per_class):
+        missing_classes = np.flatnonzero(
+            capture_bank.count < int(min_per_class)
+        )
+        raise RuntimeError(
+            "Rolling historical replay epoch snapshot missed classes at "
+            f"epoch {metadata.get('epoch')}: {missing_classes[:20].tolist()}"
+        )
+    capture_bank.save_npz(path, metadata=metadata)
+    return ArrayMemoryBank(
+        num_classes=capture_bank.num_classes,
+        max_size=capture_bank.max_size,
+        dtype=capture_bank.dtype,
+    )
+
+
 def _split_bank_stream(
     samples: np.ndarray,
     labels: np.ndarray,
@@ -1005,7 +1237,13 @@ class Logger:
             parts.append(f"mode={metrics['drift_matching']}")
         print("[train] " + " | ".join(parts), flush=True)
 
-    def log(self, metrics: dict, step: Optional[int] = None) -> None:
+    def log(
+        self,
+        metrics: dict,
+        step: Optional[int] = None,
+        *,
+        commit: bool = True,
+    ) -> None:
         if self.rank != 0:
             return
         s = step if step is not None else self._step
@@ -1013,7 +1251,10 @@ class Logger:
             f.write(json.dumps({"step": s, **metrics}) + "\n")
         self._emit_console_summary(s, metrics)
         if self.use_wandb:
-            self._wandb.log(metrics, step=s)
+            # W&B defaults to commit=False when an explicit step is supplied.
+            # Make commits explicit so a run that stops before the next logging
+            # interval still publishes its latest metrics.
+            self._wandb.log(metrics, step=s, commit=commit)
 
     def set_step(self, step: int) -> None:
         self._step = step
@@ -1139,6 +1380,8 @@ def load_mae(checkpoint_path: str, cfg: dict, device: torch.device) -> MAEResNet
     """Load a pre-trained MAEResNet and freeze it."""
     state: Any = None
     if checkpoint_path:
+        if not Path(checkpoint_path).is_file():
+            raise FileNotFoundError(f"MAE checkpoint not found: {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     mae_cfg = _resolve_mae_cfg(cfg, state)
     mae = build_mae_from_config(mae_cfg).to(device)
@@ -1154,6 +1397,11 @@ def load_mae(checkpoint_path: str, cfg: dict, device: torch.device) -> MAEResNet
             print(f"[MAE] Missing keys ({len(missing)}): {missing[:5]}{' ...' if len(missing) > 5 else ''}")
         if unexpected:
             print(f"[MAE] Unexpected keys ({len(unexpected)}): {unexpected[:5]}{' ...' if len(unexpected) > 5 else ''}")
+        if bool(cfg.get("mae_strict_load", True)) and (missing or unexpected):
+            raise RuntimeError(
+                "MAE checkpoint is not architecture-compatible: "
+                f"missing={len(missing)}, unexpected={len(unexpected)}"
+            )
 
     mae.eval()
     for p in mae.parameters():
@@ -1356,6 +1604,7 @@ def compute_drift_loss_from_features(
     mix_R_list_baseline: Tuple[float, ...] = (0.2, 0.05, 0.02),
     compute_raw_winner_stats_flag: bool = False,
     collect_diagnostics: bool = True,
+    fuse_fnorm_across_R: bool = False,
     feature_loss_weights: Optional[Dict[str, float]] = None,
     prune_zero_weight_features: bool = False,
     dual_drift_share_distances: bool = True,
@@ -1387,8 +1636,10 @@ def compute_drift_loss_from_features(
     B and the spatial token axis are merged into the batch dimension.
 
     When `compute_raw_winner_stats_flag=True`, raw L2 winner counts are
-    computed once at image level: mean-pool layer1..layer4 over tokens, concat
-    into a single (D1+D2+D3+D4,) vector per image, then cdist. Emitted under
+    computed once at image level: mean-pool the available terminal
+    layer1..layer4 features over tokens, concatenate them, then cdist. This
+    uses layer3+layer4 for a stage-3/4-only run instead of falling back to the
+    raw global latent. Emitted under
     keys "raw/pos_winner_count", "raw/pos_winner_total",
     "raw/gen_winner_count", "raw/gen_winner_total".
 
@@ -1415,12 +1666,16 @@ def compute_drift_loss_from_features(
             "Use 'rev-drift', 'fwd-drift', or 'dual-drift'."
         )
 
-    # Image-level winner stats: mean-pool layer1..layer4 over tokens, concat to
-    # a single (D1+D2+D3+D4,) vector per image, then cdist. Replaces the older
-    # first-key (norm_x) per-token approach.
+    # Image-level winner stats: mean-pool the available terminal MAE layers over
+    # tokens and concatenate them. With active_stages=[stage3, stage4], this
+    # deliberately uses only layer3/layer4 and never early-stage features.
     if compute_raw_winner_stats_flag:
-        layer_keys = ["layer1", "layer2", "layer3", "layer4"]
-        if all(k in gen_feats and k in pos_feats for k in layer_keys):
+        layer_keys = [
+            key
+            for key in ("layer1", "layer2", "layer3", "layer4")
+            if key in gen_feats and key in pos_feats
+        ]
+        if layer_keys:
             with torch.no_grad():
                 pool_gen_list = [gen_feats[k].detach().float().mean(dim=1) for k in layer_keys]
                 pool_pos_list = [pos_feats[k].detach().float().mean(dim=1) for k in layer_keys]
@@ -1616,6 +1871,8 @@ def compute_drift_loss_from_features(
                 kernel_temperature_mix_weights=rev_drift_kernel_temperature_mix_weights,
                 historical_gen=historical_bt,
                 weight_history=w_history,
+                collect_diagnostics=collect_diagnostics,
+                fuse_fnorm_across_R=fuse_fnorm_across_R,
             )
         total_loss = total_loss + feature_loss_weight * loss.mean()
         for k, v in info.items():
@@ -1797,6 +2054,17 @@ def train_step(
     feature_loss_group_normalize = bool(
         cfg.get("feature_loss_group_normalize", False)
     )
+    feature_loss_normalization_reference_count = cfg.get(
+        "feature_loss_normalization_reference_count", None
+    )
+    if feature_loss_normalization_reference_count is not None:
+        feature_loss_normalization_reference_count = int(
+            feature_loss_normalization_reference_count
+        )
+        if feature_loss_normalization_reference_count <= 0:
+            raise ValueError(
+                "feature_loss_normalization_reference_count must be positive"
+            )
     topk_diagnostic_steps = int(cfg.get("topk_diagnostic_steps", 0))
     topk_diagnostic_pos = int(cfg.get("topk_diagnostic_pos", 16))
     topk_diagnostic_neg = int(cfg.get("topk_diagnostic_neg", 40))
@@ -1846,6 +2114,21 @@ def train_step(
         throughput_opt_level < 1
         or step % max(1, diagnostics_every_k) == 0
     )
+    if throughput_opt_level >= 4 and not collect_diagnostics:
+        # W_pos/support summaries are logging-only and contain several device
+        # synchronizations; keep their configured cadence on diagnostic steps.
+        compute_wpos_stats = False
+    collect_mix_alpha_stats = _collect_mix_alpha_stats_this_step(
+        throughput_opt_level=throughput_opt_level,
+        collect_diagnostics=collect_diagnostics,
+        drift_matching=drift_matching,
+    )
+    collect_training_metrics = _collect_training_metrics_this_step(
+        throughput_opt_level=throughput_opt_level,
+        step=step,
+        log_every_k=int(cfg.get("log_every_k", 20)),
+    )
+    fuse_fnorm_across_R = throughput_opt_level >= 4
     stochastic_feature_stage_loss = bool(
         cfg.get("stochastic_feature_stage_loss", False)
     )
@@ -2106,14 +2389,16 @@ def train_step(
         active_mask_neg = None
 
     max_grad_norm = float(cfg.get("max_grad_norm", 2.0))
-    optimizer.zero_grad()
+    _zero_generator_grad(optimizer, throughput_opt_level)
     def _forward_gen_and_feats() -> Tuple[
         torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]
     ]:
         # Match the JAX generator path: bf16 model compute when enabled, while
         # attention can still upcast internally via attn_fp32.
         with _amp_ctx(gen_use_bf16):
-            out = raw_gen(expanded_labels, cfg_scale=expanded_cfg, train=True)
+            # The trainable forward must go through DistributedDataParallel so
+            # its reducer prepares gradient synchronization for this iteration.
+            out = generator(expanded_labels, cfg_scale=expanded_cfg, train=True)
         gen_samples_local = out["samples"]
         _prof_mark("after_generator")
         with _amp_ctx(mae_use_bf16):
@@ -2175,6 +2460,9 @@ def train_step(
             tuple(gen_feats.keys()),
             feature_loss_group_weights,
             normalize=feature_loss_group_normalize,
+            normalization_reference_count=(
+                feature_loss_normalization_reference_count
+            ),
         )
     if selected_feature_stages is not None:
         stochastic_weights = _feature_loss_weights_for_stages(
@@ -2250,8 +2538,9 @@ def train_step(
         global_fnorm_stats=global_fnorm_stats,
         mix_alpha=mix_alpha,
         mix_R_list_baseline=mix_R_list_baseline,
-        compute_raw_winner_stats_flag=True,
+        compute_raw_winner_stats_flag=collect_mix_alpha_stats,
         collect_diagnostics=collect_diagnostics,
+        fuse_fnorm_across_R=fuse_fnorm_across_R,
         feature_loss_weights=feature_loss_weights,
         prune_zero_weight_features=prune_skipped_feature_tensors,
         dual_drift_share_distances=dual_drift_share_distances,
@@ -2450,71 +2739,95 @@ def train_step(
         )
     _prof_mark("after_optimizer")
 
-    metrics = {
-        "loss": _ddp_mean_scalar(total_generator_loss, device),
-        "drift_loss": _ddp_mean_scalar(loss, device),
-        "g_norm": g_norm.item() if isinstance(g_norm, torch.Tensor) else float(g_norm),
-        "cfg_mean": cfg_scales.mean().item(),
-        "drift_matching": drift_matching,
-    }
-    for name, value in adapter_info.items():
-        metrics[name] = _ddp_mean_scalar(value, device)
-    for name, value in feature_gan_info.items():
-        metrics[name] = _ddp_mean_scalar(value, device)
-    for stage_name in _STOCHASTIC_FEATURE_STAGES:
-        metrics[f"drift_temperature/{stage_name}_multiplier"] = float(
-            feature_temperature_multipliers.get(
-                stage_name,
-                feature_temperature_multipliers.get("default", 1.0),
-            )
+    metrics = {"drift_matching": drift_matching}
+    if collect_training_metrics:
+        # These reductions and scalar extractions exist only for logging. Skip
+        # them on level-4 steps whose metrics will not be consumed by Logger.
+        metrics.update(
+            {
+                "loss": _ddp_mean_scalar(total_generator_loss, device),
+                "drift_loss": _ddp_mean_scalar(loss, device),
+                "g_norm": (
+                    g_norm.item()
+                    if isinstance(g_norm, torch.Tensor)
+                    else float(g_norm)
+                ),
+                "cfg_mean": cfg_scales.mean().item(),
+            }
         )
-    if feature_loss_weights is not None:
-        for group_name in _FEATURE_LOSS_GROUPS:
-            group_values = [
-                weight
-                for name, weight in feature_loss_weights.items()
-                if _feature_loss_group(name) == group_name
-            ]
-            if group_values:
-                metrics[f"feature_loss/{group_name}_weight"] = float(
-                    sum(group_values) / len(group_values)
-                )
-    if selected_feature_stages is not None:
-        selected = set(selected_feature_stages)
-        metrics["stochastic_stage/selected_count"] = float(len(selected))
-        metrics["stochastic_stage/inverse_probability"] = float(
-            len(_STOCHASTIC_FEATURE_STAGES) / len(selected)
-        )
+        for name, value in adapter_info.items():
+            metrics[name] = _ddp_mean_scalar(value, device)
+        for name, value in feature_gan_info.items():
+            metrics[name] = _ddp_mean_scalar(value, device)
         for stage_name in _STOCHASTIC_FEATURE_STAGES:
-            metrics[f"stochastic_stage/selected_{stage_name}"] = float(
-                stage_name in selected
+            metrics[f"drift_temperature/{stage_name}_multiplier"] = float(
+                feature_temperature_multipliers.get(
+                    stage_name,
+                    feature_temperature_multipliers.get("default", 1.0),
+                )
             )
+        if feature_loss_weights is not None:
+            for group_name in _FEATURE_LOSS_GROUPS:
+                group_values = [
+                    weight
+                    for name, weight in feature_loss_weights.items()
+                    if _feature_loss_group(name) == group_name
+                ]
+                if group_values:
+                    metrics[f"feature_loss/{group_name}_weight"] = float(
+                        sum(group_values) / len(group_values)
+                    )
+        if selected_feature_stages is not None:
+            selected = set(selected_feature_stages)
+            metrics["stochastic_stage/selected_count"] = float(len(selected))
+            metrics["stochastic_stage/inverse_probability"] = float(
+                len(_STOCHASTIC_FEATURE_STAGES) / len(selected)
+            )
+            for stage_name in _STOCHASTIC_FEATURE_STAGES:
+                metrics[f"stochastic_stage/selected_{stage_name}"] = float(
+                    stage_name in selected
+                )
     # Log raw coverage and the capacity-normalized ratios used by Hedge,
     # regardless of drift_matching. Tracker is created unconditionally.
     if mix_alpha_tracker is not None:
-        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-        mix_alpha_tracker.update(loss_info, world_size=world_size, device=device)
-        metrics["mix_alpha_tracker/alpha1"] = float(mix_alpha_tracker.alpha1)
-        metrics["mix_alpha_tracker/beta1"] = float(mix_alpha_tracker.beta1)
-        metrics["mix_alpha_tracker/alpha1_capacity"] = float(
-            mix_alpha_tracker.alpha1_capacity
-        )
-        metrics["mix_alpha_tracker/beta1_capacity"] = float(
-            mix_alpha_tracker.beta1_capacity
-        )
-        metrics["mix_alpha_tracker/versionb_coef"] = float(1.0 - mix_alpha)
+        if collect_mix_alpha_stats:
+            world_size = (
+                dist.get_world_size()
+                if dist.is_available() and dist.is_initialized()
+                else 1
+            )
+            mix_alpha_tracker.update(
+                loss_info,
+                world_size=world_size,
+                device=device,
+            )
+        if collect_training_metrics and collect_mix_alpha_stats:
+            metrics["mix_alpha_tracker/alpha1"] = float(
+                mix_alpha_tracker.alpha1
+            )
+            metrics["mix_alpha_tracker/beta1"] = float(
+                mix_alpha_tracker.beta1
+            )
+            metrics["mix_alpha_tracker/alpha1_capacity"] = float(
+                mix_alpha_tracker.alpha1_capacity
+            )
+            metrics["mix_alpha_tracker/beta1_capacity"] = float(
+                mix_alpha_tracker.beta1_capacity
+            )
+            metrics["mix_alpha_tracker/versionb_coef"] = float(1.0 - mix_alpha)
         # Strip lower-level mix keys; their useful values are represented by
         # the tracker metrics above.
         for _k in ("raw/pos_winner_count", "raw/pos_winner_total",
                    "raw/gen_winner_count", "raw/gen_winner_total",
                    "mix_alpha", "mix_scale_v", "mix_scale_b"):
             loss_info.pop(_k, None)
-    if profile_train_step and len(prof_marks) >= 2:
+    if collect_training_metrics and profile_train_step and len(prof_marks) >= 2:
         for i in range(1, len(prof_marks)):
             a, ta = prof_marks[i - 1]
             b, tb = prof_marks[i]
             metrics[f"prof_ms/{a}__{b}"] = (tb - ta) * 1000.0
-    metrics.update({k: float(v) for k, v in loss_info.items()})
+    if collect_training_metrics:
+        metrics.update({k: float(v) for k, v in loss_info.items()})
     extras = {
         "gen_samples_detached": gen_samples.detach(),
         "expanded_labels": expanded_labels.detach(),
@@ -2805,6 +3118,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     # --- Build generator ---
     raw_cfg = cfg.get("_raw", {})
     throughput_opt_level = int(cfg.get("throughput_opt_level", 0))
+    _configure_level4_cuda_runtime(cfg, throughput_opt_level, device)
     gen_raw = build_ditgen_from_config(raw_cfg.get("model", cfg), raw_cfg.get("dataset", cfg))
     gen_raw = gen_raw.to(device)
     if world_size > 1:
@@ -2837,9 +3151,31 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     # --- Load frozen MAE ---
     mae_ckpt = cfg.get("mae_checkpoint") or os.environ.get("MAE_CHECKPOINT", "")
     if not mae_ckpt:
-        print("[WARNING] mae_checkpoint is not set. Feature extraction will use random weights.")
+        if not bool(cfg.get("allow_random_mae", False)):
+            raise ValueError(
+                "mae_checkpoint is required for generator training. Set it in "
+                "the config/launcher, or explicitly set allow_random_mae=true "
+                "for a diagnostic-only run."
+            )
+        print(
+            "[WARNING] mae_checkpoint is not set; using random MAE weights "
+            "because allow_random_mae=true."
+        )
     mae = load_mae(mae_ckpt, cfg, device)
     feature_extractor: MAEResNet = mae
+    if is_main_process(rank):
+        raw_attention = gen_raw.model.blocks[0].attn
+        print(
+            "[throughput] "
+            f"level={throughput_opt_level} "
+            f"sdpa={bool(getattr(raw_attention, 'use_sdpa', False))} "
+            f"tf32={bool(torch.backends.cuda.matmul.allow_tf32)} "
+            f"cudnn_benchmark={bool(torch.backends.cudnn.benchmark)} "
+            f"cudnn_benchmark_limit={int(getattr(torch.backends.cudnn, 'benchmark_limit', -1))} "
+            f"gen_remat={bool(getattr(gen_raw.model, 'use_remat', False))} "
+            f"mae_remat={bool(getattr(mae, 'use_remat', False))}",
+            flush=True,
+        )
     (
         feature_adapter,
         feature_adapter_target,
@@ -2859,6 +3195,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     resolution    = int(cfg.get("resolution", 256))
     batch_size    = int(cfg.get("batch_size", 128))
     eval_bsz      = int(cfg.get("eval_batch_size", 256))
+    cache_format  = str(cfg.get("cache_format", "pt_imagefolder"))
+    eval_enabled  = bool(cfg.get("eval_enabled", True))
+    eval_split    = str(cfg.get("eval_split", "val"))
 
     train_loader, preprocess_fn, postprocess_fn = create_imagenet_split(
         imagenet_path=imagenet_path,
@@ -2869,6 +3208,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         use_latent=use_latent,
         use_cache=use_cache,
         cache_path=cache_path,
+        cache_format=cache_format,
         num_workers=int(cfg.get("num_workers", 8)),
         pin_memory=bool(cfg.get("pin_memory", True)),
         distributed=(world_size > 1),
@@ -2878,18 +3218,22 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     )
     eval_loader = None
     eval_postprocess_fn = None
-    if is_main_process(rank):
+    if is_main_process(rank) and eval_enabled:
         # Eval is only run on rank 0 below. Build a non-sharded val loader so
         # intermediate FID/IS uses the full validation distribution.
         eval_loader, _, eval_postprocess_fn = create_imagenet_split(
             imagenet_path=imagenet_path,
             resolution=resolution,
             batch_size=eval_bsz,
-            split="val",
+            split=eval_split,
             use_aug=False,
             use_latent=use_latent,
             use_cache=use_cache,
             cache_path=cache_path,
+            cache_format=cache_format,
+            shuffle=False,
+            drop_last=False,
+            random_flip=False,
             num_workers=int(cfg.get("num_workers", 8)),
             pin_memory=bool(cfg.get("pin_memory", True)),
             distributed=False,
@@ -3041,6 +3385,18 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             "raw/global features=1"
         )
 
+        active_stages = cfg.get("activation_kwargs", {}).get(
+            "active_stages", None
+        )
+        active_stage_summary = (
+            "all" if active_stages is None else ",".join(active_stages)
+        )
+        print(
+            "[mae-activations] "
+            f"active_stages={active_stage_summary}; "
+            "earlier encoder stages still execute when required by later stages"
+        )
+
         feature_loss_profile = str(cfg.get("feature_loss_profile", "all"))
         feature_group_weights = _resolve_feature_loss_group_weights(cfg)
         feature_weight_summary = " ".join(
@@ -3050,7 +3406,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         print(
             "[feature-loss] "
             f"profile={feature_loss_profile} {feature_weight_summary}; "
-            f"mass_normalize={str(bool(cfg.get('feature_loss_group_normalize', False))).lower()}"
+            f"mass_normalize={str(bool(cfg.get('feature_loss_group_normalize', False))).lower()} "
+            "normalization_reference_count="
+            f"{cfg.get('feature_loss_normalization_reference_count', 'active')}"
         )
         if feature_adapter is None:
             print("[feature-adapter] disabled (frozen MAE metric)")
@@ -3116,6 +3474,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         cfg.get("historical_gen_replay_source", "frozen_snapshot")
     ).lower().strip()
     historical_replay_bank: Optional[ArrayMemoryBank] = None
+    rolling_capture_bank: Optional[ArrayMemoryBank] = None
+    rolling_loaded_target_epoch: Optional[int] = None
+    rolling_replay_lag_epochs = 0
     historical_replay_start_step = 0
     historical_replay_path = (
         Path(workdir) / f"historical_gen_replay_rank{rank:02d}.npz"
@@ -3142,15 +3503,38 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             raise ValueError(
                 "historical_gen_replay_bank_count cannot exceed gen_per_label"
             )
-        if historical_replay_source not in ("frozen_snapshot", "fresh_current"):
+        if historical_replay_source not in (
+            "frozen_snapshot",
+            "fresh_current",
+            "rolling_lag",
+        ):
             raise ValueError(
-                "historical_gen_replay_source must be frozen_snapshot or "
-                f"fresh_current, got {historical_replay_source!r}"
+                "historical_gen_replay_source must be frozen_snapshot, "
+                "fresh_current, or rolling_lag; "
+                f"got {historical_replay_source!r}"
             )
         if not math.isfinite(historical_replay_start_epochs) or historical_replay_start_epochs <= 0.0:
             raise ValueError(
                 "historical_gen_replay_start_generated_epochs must be finite and positive"
             )
+        if historical_replay_source == "rolling_lag":
+            rolling_lag_value = float(
+                cfg.get(
+                    "historical_gen_replay_lag_generated_epochs",
+                    historical_replay_start_epochs,
+                )
+            )
+            if (
+                not math.isfinite(rolling_lag_value)
+                or rolling_lag_value <= 0.0
+                or not rolling_lag_value.is_integer()
+            ):
+                raise ValueError(
+                    "historical_gen_replay_lag_generated_epochs must be a "
+                    "positive integer for rolling_lag"
+                )
+            rolling_replay_lag_epochs = int(rolling_lag_value)
+            historical_replay_start_epochs = float(rolling_replay_lag_epochs)
         storage_dtype_name = str(
             cfg.get("historical_gen_replay_storage_dtype", "float16")
         ).lower().strip()
@@ -3170,13 +3554,24 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 max_size=historical_replay_bank_count,
                 dtype=storage_dtypes[storage_dtype_name],
             )
+        elif historical_replay_source == "rolling_lag":
+            rolling_capture_bank = ArrayMemoryBank(
+                num_classes=int(cfg.get("num_classes", 1000)),
+                max_size=historical_replay_bank_count,
+                dtype=storage_dtypes[storage_dtype_name],
+            )
         if is_main_process(rank):
+            snapshot_summary = (
+                f"rolling_lag_epochs={rolling_replay_lag_epochs}"
+                if historical_replay_source == "rolling_lag"
+                else f"snapshot_epoch={historical_replay_start_epochs:g}"
+            )
             print(
                 "[historical-replay] enabled "
                 f"source={historical_replay_source} "
                 f"ratio={historical_replay_ratio:g} count={historical_replay_count} "
                 f"bank_count={historical_replay_bank_count} "
-                f"snapshot_epoch={historical_replay_start_epochs:g} "
+                f"{snapshot_summary} "
                 f"snapshot_step={historical_replay_start_step} "
                 f"storage_dtype={storage_dtype_name}; "
                 "current/replay generated mass is preserved",
@@ -3201,6 +3596,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             "save_per_generated_epochs must be finite and >= 0, got "
             f"{save_per_generated_epochs}"
         )
+    eval_per_generated_epochs = float(
+        cfg.get("eval_per_generated_epochs", 0.0)
+    )
+    if eval_per_generated_epochs < 0.0 or not math.isfinite(
+        eval_per_generated_epochs
+    ):
+        raise ValueError(
+            "eval_per_generated_epochs must be finite and >= 0, got "
+            f"{eval_per_generated_epochs}"
+        )
     if is_main_process(rank):
         target_summary = (
             f" target_epochs={total_generated_epochs:g}"
@@ -3212,11 +3617,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             if save_per_generated_epochs > 0.0
             else ""
         )
+        eval_summary = (
+            f" eval_every_epochs={eval_per_generated_epochs:g}"
+            if eval_per_generated_epochs > 0.0
+            else ""
+        )
         print(
             "[generated-epochs] "
             f"dataset_size={generated_epoch_size} "
             f"generated_per_step={generated_per_step}"
-            f"{target_summary}{save_summary} "
+            f"{target_summary}{save_summary}{eval_summary} "
             f"total_steps={int(cfg.get('total_steps', 200000))}"
         )
 
@@ -3253,6 +3663,53 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 f"[historical-replay] restored frozen snapshot from {historical_replay_path}",
                 flush=True,
             )
+    if rolling_capture_bank is not None and start_step > 0:
+        resumed_at_epoch_boundary = (
+            _rolling_snapshot_epoch_after_step(
+                step=start_step - 1,
+                generated_per_step=generated_per_step,
+                dataset_size=generated_epoch_size,
+            )
+            is not None
+        )
+        if not resumed_at_epoch_boundary:
+            rolling_capture_path = _rolling_replay_capture_path(
+                workdir,
+                rank=rank,
+                step=start_step,
+            )
+            if not rolling_capture_path.is_file():
+                raise FileNotFoundError(
+                    "Cannot resume rolling historical replay without its "
+                    f"step-matched capture state: {rolling_capture_path}"
+                )
+            capture_epoch = _generated_epoch_index(
+                completed_steps=start_step,
+                generated_per_step=generated_per_step,
+                dataset_size=generated_epoch_size,
+            )
+            rolling_capture_bank.load_npz(
+                rolling_capture_path,
+                expected_metadata=_rolling_replay_metadata(
+                    kind="rolling_capture",
+                    rank=rank,
+                    world_size=world_size,
+                    num_classes=int(cfg.get("num_classes", 1000)),
+                    bank_count=historical_replay_bank_count,
+                    storage_dtype=storage_dtype_name,
+                    lag_epochs=rolling_replay_lag_epochs,
+                    dataset_size=generated_epoch_size,
+                    generated_per_step=generated_per_step,
+                    epoch=capture_epoch,
+                    step=start_step,
+                ),
+            )
+            if is_main_process(rank):
+                print(
+                    "[historical-replay] restored rolling capture state from "
+                    f"{rolling_capture_path}",
+                    flush=True,
+                )
 
     total_steps  = int(cfg.get("total_steps", 200000))
     save_per     = int(cfg.get("save_per_step", 2000))
@@ -3273,19 +3730,12 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     # Within-epoch skip would iterate (and load) thousands of batches just to discard them.
     _epoch_at_resume = start_step // max(len(train_loader), 1) if start_step > 0 else 0
     train_iter = infinite_sampler(train_loader, _epoch_at_resume * max(len(train_loader), 1))
-    pbar = (
-        tqdm(range(start_step, total_steps), initial=start_step, total=total_steps)
-        if is_main_process(rank)
-        else range(start_step, total_steps)
-    )
-
-    start_time_all = time.time()
     is_first_step = True
     bank_stream_phase = 0
 
     # --- Optional step-0 eval (baseline before any training) ---
     eval_at_start = bool(cfg.get("eval_at_start", False))
-    if start_step == 0 and eval_at_start:
+    if start_step == 0 and eval_enabled and eval_at_start:
         if world_size > 1:
             dist.barrier()
         if is_main_process(rank):
@@ -3294,9 +3744,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             else:
                 print("[eval] Running step-0 baseline eval...")
                 try:
-                    generator.to("cpu")
+                    # DDP reducers retain parameter/bucket references created
+                    # at construction time. Moving a rank-0-only DDP module
+                    # CPU -> CUDA invalidates those references and desynchronizes
+                    # the next backward pass from the waiting rank(s). Keep DDP
+                    # modules on their construction device; 48 GiB A6000 jobs
+                    # have ample headroom for the temporary eval models.
+                    if world_size == 1:
+                        generator.to("cpu")
                     mae.to("cpu")
-                    if feature_discriminator is not None:
+                    if feature_discriminator is not None and world_size == 1:
                         feature_discriminator.to("cpu")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -3324,7 +3781,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                             if eval_stats.get("is_std") is not None:
                                 log_eval[f"is_std/cfg{eval_cfg_scale}"] = float(eval_stats["is_std"])
                     if log_eval:
-                        logger.log(log_eval, step=0)
+                        # Merge baseline metrics into the first training row;
+                        # the step-0 train log below commits the combined row.
+                        logger.log(log_eval, step=0, commit=False)
                 except Exception as e:
                     print(f"[eval] Step-0 eval failed: {e}")
                     traceback.print_exc()
@@ -3338,8 +3797,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                         torch.cuda.empty_cache()
                     ema.shadow.to(device)
                     mae.to(device)
-                    generator.to(device)
-                    if feature_discriminator is not None:
+                    if world_size == 1:
+                        generator.to(device)
+                    if feature_discriminator is not None and world_size == 1:
                         feature_discriminator.to(device)
                     gc.collect()
                     if torch.cuda.is_available():
@@ -3353,6 +3813,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         generator.train()
     elif start_step == 0 and is_main_process(rank):
         print("[eval] Skipping step-0 eval (eval_at_start=false).")
+
+    # Start progress and average-step timing only after the optional baseline
+    # evaluation. Otherwise the first displayed iteration includes several
+    # minutes of FID/IS work and falsely reports training as ~100x slower.
+    pbar = (
+        tqdm(range(start_step, total_steps), initial=start_step, total=total_steps)
+        if is_main_process(rank)
+        else range(start_step, total_steps)
+    )
+    start_time_all = time.time()
 
     step_limit = int(cfg.get("train_max_step_exclusive", 0) or 0)
     for step in pbar:
@@ -3445,7 +3915,83 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         pos_smp = torch.cat(pos_parts, dim=0)
         neg_smp = torch.cat(neg_parts, dim=0)
         historical_smp = None
-        if historical_replay_bank is not None and step >= historical_replay_start_step:
+        rolling_current_epoch: Optional[int] = None
+        rolling_target_epoch: Optional[int] = None
+        if rolling_capture_bank is not None:
+            rolling_current_epoch = _generated_epoch_index(
+                completed_steps=step,
+                generated_per_step=generated_per_step,
+                dataset_size=generated_epoch_size,
+            )
+            rolling_target_epoch = _rolling_replay_target_epoch(
+                completed_steps=step,
+                generated_per_step=generated_per_step,
+                dataset_size=generated_epoch_size,
+                lag_epochs=rolling_replay_lag_epochs,
+            )
+            if (
+                rolling_target_epoch is not None
+                and rolling_target_epoch != rolling_loaded_target_epoch
+            ):
+                target_path = _rolling_replay_snapshot_path(
+                    workdir,
+                    rank=rank,
+                    epoch=rolling_target_epoch,
+                )
+                if not target_path.is_file():
+                    raise FileNotFoundError(
+                        "Rolling historical replay target is missing: "
+                        f"current_epoch={rolling_current_epoch} "
+                        f"target_epoch={rolling_target_epoch} path={target_path}"
+                    )
+                target_bank = ArrayMemoryBank(
+                    num_classes=int(cfg.get("num_classes", 1000)),
+                    max_size=historical_replay_bank_count,
+                    dtype=storage_dtypes[storage_dtype_name],
+                )
+                target_bank.load_npz(
+                    target_path,
+                    expected_metadata=_rolling_replay_metadata(
+                        kind="rolling_epoch_snapshot",
+                        rank=rank,
+                        world_size=world_size,
+                        num_classes=int(cfg.get("num_classes", 1000)),
+                        bank_count=historical_replay_bank_count,
+                        storage_dtype=storage_dtype_name,
+                        lag_epochs=rolling_replay_lag_epochs,
+                        dataset_size=generated_epoch_size,
+                        generated_per_step=generated_per_step,
+                        epoch=rolling_target_epoch,
+                    ),
+                )
+                if not target_bank.is_ready(historical_replay_count):
+                    raise RuntimeError(
+                        "Rolling historical replay snapshot is incomplete: "
+                        f"{target_path}"
+                    )
+                historical_replay_bank = target_bank
+                rolling_loaded_target_epoch = rolling_target_epoch
+                if is_main_process(rank):
+                    print(
+                        "[historical-replay] rolling target "
+                        f"current_epoch={rolling_current_epoch} "
+                        f"target_epoch={rolling_target_epoch} path={target_path}",
+                        flush=True,
+                    )
+        historical_bank_active = (
+            historical_replay_bank is not None
+            and (
+                (
+                    historical_replay_source == "rolling_lag"
+                    and rolling_target_epoch is not None
+                )
+                or (
+                    historical_replay_source == "frozen_snapshot"
+                    and step >= historical_replay_start_step
+                )
+            )
+        )
+        if historical_bank_active:
             if not historical_replay_bank.is_ready(historical_replay_count):
                 raise RuntimeError(
                     "Historical replay reached its activation step before all class "
@@ -3495,7 +4041,16 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             fresh_historical_count=fresh_historical_count,
         )
         ema.update(gen_raw)
-        if historical_replay_bank is not None and step < historical_replay_start_step:
+        capture_bank: Optional[ArrayMemoryBank] = None
+        if (
+            historical_replay_source == "frozen_snapshot"
+            and historical_replay_bank is not None
+            and step < historical_replay_start_step
+        ):
+            capture_bank = historical_replay_bank
+        elif rolling_capture_bank is not None:
+            capture_bank = rolling_capture_bank
+        if capture_bank is not None:
             local_label_count = int(labels_t.shape[0])
             generated = step_extras["gen_samples_detached"].reshape(
                 local_label_count,
@@ -3503,8 +4058,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 *step_extras["gen_samples_detached"].shape[1:],
             )
             # The final H candidates for each selected class replace that
-            # class's snapshot, so the frozen bank represents the generator
-            # immediately before the configured epoch boundary.
+            # class's capture entries, matching the frozen-snapshot policy.
             snapshot_samples = generated[:, -historical_replay_bank_count:].reshape(
                 local_label_count * historical_replay_bank_count,
                 *generated.shape[2:],
@@ -3512,20 +4066,23 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             snapshot_labels = labels_t[:, None].expand(
                 -1, historical_replay_bank_count
             ).reshape(-1)
-            historical_replay_bank.add(
+            capture_bank.add(
                 snapshot_samples.detach().to(device="cpu", dtype=torch.float32),
                 snapshot_labels,
             )
-            if step + 1 == historical_replay_start_step:
-                if not historical_replay_bank.is_ready(historical_replay_bank_count):
+            if (
+                historical_replay_source == "frozen_snapshot"
+                and step + 1 == historical_replay_start_step
+            ):
+                if not capture_bank.is_ready(historical_replay_bank_count):
                     missing_classes = np.flatnonzero(
-                        historical_replay_bank.count < historical_replay_bank_count
+                        capture_bank.count < historical_replay_bank_count
                     )
                     raise RuntimeError(
                         "Historical replay snapshot warmup missed classes: "
                         f"{missing_classes[:20].tolist()}"
                     )
-                historical_replay_bank.save_npz(historical_replay_path)
+                capture_bank.save_npz(historical_replay_path)
                 if is_main_process(rank):
                     print(
                         "[historical-replay] froze epoch "
@@ -3533,6 +4090,43 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                         f"{historical_replay_path}",
                         flush=True,
                     )
+            elif historical_replay_source == "rolling_lag":
+                snapshot_epoch = _rolling_snapshot_epoch_after_step(
+                    step=step,
+                    generated_per_step=generated_per_step,
+                    dataset_size=generated_epoch_size,
+                )
+                if snapshot_epoch is not None:
+                    snapshot_path = _rolling_replay_snapshot_path(
+                        workdir,
+                        rank=rank,
+                        epoch=snapshot_epoch,
+                    )
+                    rolling_capture_bank = (
+                        _save_rolling_epoch_snapshot_and_reset(
+                            capture_bank,
+                            snapshot_path,
+                            metadata=_rolling_replay_metadata(
+                                kind="rolling_epoch_snapshot",
+                                rank=rank,
+                                world_size=world_size,
+                                num_classes=int(cfg.get("num_classes", 1000)),
+                                bank_count=historical_replay_bank_count,
+                                storage_dtype=storage_dtype_name,
+                                lag_epochs=rolling_replay_lag_epochs,
+                                dataset_size=generated_epoch_size,
+                                generated_per_step=generated_per_step,
+                                epoch=snapshot_epoch,
+                            ),
+                            min_per_class=historical_replay_bank_count,
+                        )
+                    )
+                    if is_main_process(rank):
+                        print(
+                            "[historical-replay] saved rolling snapshot "
+                            f"epoch={snapshot_epoch} path={snapshot_path}",
+                            flush=True,
+                        )
         if benchmark_profile and device.type == "cuda":
             torch.cuda.synchronize(device)
             metrics["profile/peak_allocated_gib"] = (
@@ -3553,6 +4147,15 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             metrics["generated_epochs"] = (
                 (step + 1) * generated_per_step / generated_epoch_size
             )
+            if rolling_current_epoch is not None:
+                metrics["historical_replay/current_epoch"] = float(
+                    rolling_current_epoch
+                )
+                metrics["historical_replay/target_epoch"] = float(
+                    rolling_target_epoch
+                    if rolling_target_epoch is not None
+                    else -1
+                )
             logger.log(metrics)
 
         # --- Checkpoint ---
@@ -3566,6 +4169,39 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         else:
             save_due = (step + 1) % save_per == 0
         if save_due or (step + 1) == total_steps:
+            if (
+                rolling_capture_bank is not None
+                and rolling_capture_bank.bank is not None
+            ):
+                capture_step = step + 1
+                capture_epoch = _generated_epoch_index(
+                    completed_steps=capture_step,
+                    generated_per_step=generated_per_step,
+                    dataset_size=generated_epoch_size,
+                )
+                capture_path = _rolling_replay_capture_path(
+                    workdir,
+                    rank=rank,
+                    step=capture_step,
+                )
+                rolling_capture_bank.save_npz(
+                    capture_path,
+                    metadata=_rolling_replay_metadata(
+                        kind="rolling_capture",
+                        rank=rank,
+                        world_size=world_size,
+                        num_classes=int(cfg.get("num_classes", 1000)),
+                        bank_count=historical_replay_bank_count,
+                        storage_dtype=storage_dtype_name,
+                        lag_epochs=rolling_replay_lag_epochs,
+                        dataset_size=generated_epoch_size,
+                        generated_per_step=generated_per_step,
+                        epoch=capture_epoch,
+                        step=capture_step,
+                    ),
+                )
+            if rolling_capture_bank is not None and world_size > 1:
+                dist.barrier()
             if is_main_process(rank):
                 save_checkpoint(
                     workdir,
@@ -3583,9 +4219,20 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                     feature_discriminator=feature_discriminator,
                     feature_discriminator_optimizer=feature_discriminator_optimizer,
                 )
+            if rolling_capture_bank is not None and world_size > 1:
+                dist.barrier()
 
         # --- FID / IS evaluation ---
-        if (step + 1) % eval_per == 0 or (step + 1) == total_steps:
+        if eval_per_generated_epochs > 0.0:
+            eval_due = _crosses_generated_epoch_interval(
+                completed_steps=step + 1,
+                generated_per_step=generated_per_step,
+                dataset_size=generated_epoch_size,
+                interval_epochs=eval_per_generated_epochs,
+            )
+        else:
+            eval_due = (step + 1) % eval_per == 0
+        if eval_enabled and (eval_due or (step + 1) == total_steps):
             # Barrier: ensure all ranks finish the current training step before
             # rank 0 starts eval. Without this, other ranks proceed to the next
             # train_step (which triggers a DDP all_reduce) while rank 0 is still
@@ -3596,14 +4243,15 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 if eval_loader is None or eval_postprocess_fn is None:
                     print("[eval] eval_loader/eval_postprocess_fn is None. Skipping eval.")
                 else:
-                    # Offload training models to CPU to free GPU memory for eval.
-                    # FID/IS requires VAE decoder + Inception V3 on top of the
-                    # generator, which would OOM if training models stay on GPU.
-                    print(f"[eval] Offloading training models to CPU for eval at step {step+1}...")
+                    # Keep DDP modules on the devices where their reducers were
+                    # constructed. Rank-0-only CPU round trips corrupt reducer
+                    # bucket state and deadlock the following backward pass.
+                    print(f"[eval] Preparing rank-0 eval at step {step+1}...")
                     try:
-                        generator.to("cpu")
+                        if world_size == 1:
+                            generator.to("cpu")
                         mae.to("cpu")
-                        if feature_discriminator is not None:
+                        if feature_discriminator is not None and world_size == 1:
                             feature_discriminator.to("cpu")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -3647,8 +4295,9 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                             torch.cuda.empty_cache()
                         ema.shadow.to(device)
                         mae.to(device)
-                        generator.to(device)
-                        if feature_discriminator is not None:
+                        if world_size == 1:
+                            generator.to(device)
+                        if feature_discriminator is not None and world_size == 1:
                             feature_discriminator.to(device)
                         gc.collect()
                         if torch.cuda.is_available():
@@ -3689,8 +4338,12 @@ def main() -> None:
         "--throughput_opt_level",
         type=int,
         default=-1,
-        choices=(0, 1, 2, 3),
-        help="Benchmark/runtime stack: 0=baseline, 1=diagnostic gating, 2=+fused MAE stats, 3=+DDP/optimizer/EMA fast paths.",
+        choices=(0, 1, 2, 3, 4),
+        help=(
+            "Benchmark/runtime stack: 0=baseline, 1=diagnostic gating, "
+            "2=+fused MAE stats, 3=+DDP/optimizer/EMA fast paths, "
+            "4=+packed reverse f-norm reductions/runtime fast paths."
+        ),
     )
     parser.add_argument(
         "--benchmark_throughput",

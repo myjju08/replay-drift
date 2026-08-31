@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import random
+from glob import glob
 from typing import Iterator, Optional, Tuple
 
 import numpy as np
@@ -32,14 +33,28 @@ def _center_crop(img: Image.Image, size: int) -> Image.Image:
 class _LatentCacheDataset(datasets.DatasetFolder):
     """ImageFolder-style dataset that loads pre-encoded VAE latent .pt files."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, random_flip: bool = True):
         super().__init__(root=root, loader=str, extensions=(".pt",))
+        self.random_flip = bool(random_flip)
 
     def __getitem__(self, index: int):
         path, target = self.samples[index]
         data = torch.load(path, map_location="cpu", weights_only=False)
-        moments = data["moments"] if torch.rand(1).item() < 0.5 else data["moments_flip"]
-        return np.asarray(moments), target
+        required = {"moments", "moments_flip"}
+        if not isinstance(data, dict) or not required.issubset(data):
+            raise ValueError(
+                f"Invalid PT latent cache sample {path}: expected keys "
+                f"{sorted(required)}"
+            )
+        use_flip = self.random_flip and torch.rand(1).item() >= 0.5
+        key = "moments_flip" if use_flip else "moments"
+        moments = np.asarray(data[key])
+        if moments.shape != (4, 32, 32):
+            raise ValueError(
+                f"Invalid PT latent shape in {path}:{key}: {moments.shape}; "
+                "expected (4, 32, 32)"
+            )
+        return moments, target
 
 
 class _NpyFlatLatentDataset(torch.utils.data.Dataset):
@@ -76,6 +91,82 @@ class _NpyFlatLatentDataset(torch.utils.data.Dataset):
         feat = feat.squeeze(0)   # (4, 32, 32)
         label = int(lbl.flat[0])
         return feat, label
+
+
+class _HFParquetLatentDataset(torch.utils.data.Dataset):
+    """ImageNet VAE latents backed by local Hugging Face cache shards.
+
+    The usual layout contains ``train-*.parquet`` source files and lets
+    :func:`datasets.load_dataset` reuse/build its Arrow cache.  A staging-only
+    layout may instead contain the already materialized
+    ``parquet-train-*.arrow`` shards directly; this is byte-identical while
+    avoiding a second copy of the Parquet sources on another server.
+    """
+
+    def __init__(self, cache_root: str, random_flip: bool = True):
+        try:
+            from datasets import Dataset, concatenate_datasets, load_dataset
+        except ImportError as exc:
+            raise ImportError(
+                "cache_format='hf_parquet' requires the 'datasets' package."
+            ) from exc
+
+        shards = sorted(glob(os.path.join(cache_root, "train-*.parquet")))
+        if shards:
+            self.dataset = load_dataset(
+                "parquet",
+                data_files={"train": shards},
+                split="train",
+                cache_dir=os.path.join(cache_root, ".arrow_cache"),
+            )
+        else:
+            arrow_shards = sorted(
+                glob(os.path.join(cache_root, "parquet-train-*.arrow"))
+            )
+            if not arrow_shards:
+                raise FileNotFoundError(
+                    "No train-*.parquet or parquet-train-*.arrow shards found "
+                    f"in: {cache_root}"
+                )
+            self.dataset = concatenate_datasets(
+                [Dataset.from_file(path) for path in arrow_shards]
+            )
+        required = {"latent_mean", "latent_mean_flip", "label"}
+        missing = required.difference(self.dataset.column_names)
+        if missing:
+            raise ValueError(f"HF latent cache is missing columns: {sorted(missing)}")
+        self.dataset.set_format(
+            type="numpy",
+            columns=["latent_mean", "latent_mean_flip", "label"],
+        )
+        self.random_flip = bool(random_flip)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        row = self.dataset[index]
+        use_flip = self.random_flip and torch.rand(1).item() >= 0.5
+        key = "latent_mean_flip" if use_flip else "latent_mean"
+        latent = np.asarray(row[key], dtype=np.float32).reshape(4, 32, 32)
+        return latent, int(row["label"])
+
+
+def infer_latent_cache_format(cache_root: str) -> str:
+    """Infer one supported latent-cache layout from its filesystem tree."""
+    if os.path.isdir(os.path.join(cache_root, "train")):
+        return "pt_imagefolder"
+    if glob(os.path.join(cache_root, "train-*.parquet")) or glob(
+        os.path.join(cache_root, "parquet-train-*.arrow")
+    ):
+        return "hf_parquet"
+    if os.path.isdir(os.path.join(cache_root, "imagenet256_features")):
+        return "npy_flat"
+    raise ValueError(
+        "Could not infer latent cache format from "
+        f"{cache_root}. Expected train/<class>/*.pt, train-*.parquet, "
+        "parquet-train-*.arrow, or imagenet256_features/."
+    )
 
 
 def _build_transforms(resolution: int, use_aug: bool, split: str):
@@ -115,7 +206,10 @@ def create_imagenet_split(
     use_latent: bool = False,
     use_cache: bool = False,
     cache_path: str = "",
-    cache_format: str = "pt_imagefolder",   # "pt_imagefolder" | "npy_flat"
+    cache_format: str = "pt_imagefolder",   # "auto" | "pt_imagefolder" | "npy_flat" | "hf_parquet"
+    shuffle: Optional[bool] = None,
+    drop_last: Optional[bool] = None,
+    random_flip: bool = True,
     num_workers: int = 8,
     prefetch_factor: int = 2,
     pin_memory: bool = True,
@@ -137,18 +231,41 @@ def create_imagenet_split(
                 "cache_path must be set when use_cache=True. "
                 "Set `cache_path` in config or IMAGENET_CACHE_PATH."
             )
+        if cache_format == "auto":
+            cache_format = infer_latent_cache_format(cache_path)
         if cache_format == "npy_flat":
+            if split != "train":
+                raise ValueError(
+                    "cache_format='npy_flat' currently contains only the train split."
+                )
             # Flat-index .npy layout: cache_path/imagenet256_features & imagenet256_labels
             # (no train/val subdirectory — full train set only)
             ds = _NpyFlatLatentDataset(cache_root=cache_path)
-        else:
+        elif cache_format == "hf_parquet":
+            if split != "train":
+                raise ValueError(
+                    "cache_format='hf_parquet' currently contains only the train split."
+                )
+            ds = _HFParquetLatentDataset(
+                cache_root=cache_path,
+                random_flip=random_flip,
+            )
+        elif cache_format == "pt_imagefolder":
             split_root = os.path.join(cache_path, split)
             if not os.path.isdir(split_root):
                 raise FileNotFoundError(
                     f"Latent cache split not found: {split_root}. "
                     "Expected cache root with train/ and val/."
                 )
-            ds = _LatentCacheDataset(root=split_root)
+            ds = _LatentCacheDataset(
+                root=split_root,
+                random_flip=random_flip,
+            )
+        else:
+            raise ValueError(
+                f"Unknown cache_format={cache_format!r}; expected one of "
+                "'auto', 'pt_imagefolder', 'npy_flat', or 'hf_parquet'."
+            )
     else:
         if not imagenet_path:
             raise ValueError(
@@ -164,15 +281,23 @@ def create_imagenet_split(
         tf = _build_transforms(resolution, use_aug=use_aug, split=split)
         ds = datasets.ImageFolder(root=split_root, transform=tf)
 
+    should_shuffle = (split == "train") if shuffle is None else bool(shuffle)
+    should_drop_last = (split == "train") if drop_last is None else bool(drop_last)
+
     sampler = None
     if distributed:
-        sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=(split == "train"))
+        sampler = DistributedSampler(
+            ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=should_shuffle,
+        )
 
     loader = DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=(sampler is None and split == "train"),
-        drop_last=(split == "train"),
+        shuffle=(sampler is None and should_shuffle),
+        drop_last=should_drop_last,
         sampler=sampler,
         num_workers=num_workers,
         prefetch_factor=(prefetch_factor if num_workers > 0 else None),
