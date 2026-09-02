@@ -102,19 +102,22 @@ print(
 )
 PY
 
-# Require the reviewed DDP synchronization and active-stage feature extraction
-# changes, and reject any other tracked source change.
-EXPECTED_TRACKED_CHANGES=(
+# Require the committed DDP synchronization, active-stage extraction, and
+# throughput implementation while rejecting uncommitted runtime-code edits.
+# Configs and this launcher may be added/edited to define a new experiment;
+# the imported Python modules must match the recorded source HEAD exactly.
+RUNTIME_SOURCE_FILES=(
   "drifting_core/imagenet_loss.py"
+  "memory_bank.py"
   "models/imagenet_generator.py"
   "models/mae_resnet.py"
-  "tests/test_feature_adapter.py"
+  "train/train_data.py"
   "train_imagenet_gen.py"
 )
-mapfile -t TRACKED_CHANGES < <(git -C "${CODE_ROOT}" diff --name-only)
-if [[ "${TRACKED_CHANGES[*]}" != "${EXPECTED_TRACKED_CHANGES[*]}" ]]; then
-  echo "Unexpected tracked changes in I-Drift." >&2
-  git -C "${CODE_ROOT}" status --short >&2
+if ! git -C "${CODE_ROOT}" diff --quiet -- "${RUNTIME_SOURCE_FILES[@]}" || \
+   ! git -C "${CODE_ROOT}" diff --cached --quiet -- "${RUNTIME_SOURCE_FILES[@]}"; then
+  echo "Uncommitted runtime source changes in I-Drift." >&2
+  git -C "${CODE_ROOT}" status --short -- "${RUNTIME_SOURCE_FILES[@]}" >&2
   exit 2
 fi
 if ! grep -Fq 'out = generator(expanded_labels, cfg_scale=expanded_cfg, train=True)' \
@@ -122,10 +125,9 @@ if ! grep -Fq 'out = generator(expanded_labels, cfg_scale=expanded_cfg, train=Tr
   echo "Required DDP synchronization fix is missing." >&2
   exit 2
 fi
-EXPECTED_SOURCE_DIFF_SHA256="3e63f8bdca946e9b55d5eb5d3d0b97fe13083979d375c8bc5b3c8c966baafc97"
-ACTUAL_SOURCE_DIFF_SHA256="$(git -C "${CODE_ROOT}" diff -- "${EXPECTED_TRACKED_CHANGES[@]}" | sha256sum | awk '{print $1}')"
-if [[ "${ACTUAL_SOURCE_DIFF_SHA256}" != "${EXPECTED_SOURCE_DIFF_SHA256}" ]]; then
-  echo "The I-Drift source diff is not the reviewed S4 training patch." >&2
+if ! grep -Fq 'fuse_fnorm_across_R = throughput_opt_level >= 4' \
+  "${CODE_ROOT}/train_imagenet_gen.py"; then
+  echo "Required committed throughput implementation is missing." >&2
   exit 2
 fi
 
