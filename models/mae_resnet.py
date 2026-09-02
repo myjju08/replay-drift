@@ -472,14 +472,14 @@ class MAEResNet(nn.Module):
                 x,
                 return_block_outputs=True,
                 use_remat=self.use_remat,
-                capture_stages=None if return_stage_features else selected_stages,
+                capture_stages=selected_stages,
                 block_output_stages=selected_stages,
             )
         else:
             feats = self.encoder(
                 x,
                 use_remat=self.use_remat,
-                capture_stages=None if return_stage_features else selected_stages,
+                capture_stages=selected_stages,
             )
             block_outs = {}
 

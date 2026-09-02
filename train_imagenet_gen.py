@@ -1079,6 +1079,19 @@ def load_checkpoint(
     optimizer.load_state_dict(state["optimizer"])
     if mix_alpha_tracker is not None and "mix_alpha_tracker" in state:
         mix_alpha_tracker.load_state_dict(state["mix_alpha_tracker"])
+    adapter_state_keys = {
+        "feature_adapter",
+        "feature_adapter_target",
+        "feature_adapter_optimizer",
+    }
+    if feature_adapter is not None:
+        present_adapter_keys = adapter_state_keys.intersection(state)
+        if present_adapter_keys != adapter_state_keys:
+            missing = sorted(adapter_state_keys.difference(present_adapter_keys))
+            raise RuntimeError(
+                "Adapter-enabled resume requires a complete adapter checkpoint; "
+                f"missing keys: {missing}"
+            )
     if feature_adapter is not None and "feature_adapter" in state:
         raw_adapter = (
             feature_adapter.module
@@ -1422,14 +1435,19 @@ def build_feature_adapter_system(
     Optional[FeatureAdapterSystem],
     Optional[torch.optim.Optimizer],
 ]:
-    """Build the real-supervised online adapter and frozen EMA drift target."""
+    """Build the separately optimized online adapter and frozen drift target."""
     if not bool(cfg.get("feature_adapter", False)):
         return None, None, None
 
     objective = str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
-    if objective not in ("supcon", "supcon_ce"):
+    if objective not in (
+        "supcon",
+        "supcon_ce",
+        "gen_real_multipos_infonce",
+    ):
         raise ValueError(
-            "feature_adapter_objective must be 'supcon' or 'supcon_ce', "
+            "feature_adapter_objective must be 'supcon', 'supcon_ce', or "
+            "'gen_real_multipos_infonce', "
             f"got {objective!r}"
         )
     stages = canonical_adapter_stages(
@@ -1447,6 +1465,7 @@ def build_feature_adapter_system(
         num_classes=int(cfg.get("num_classes", 1000)),
         dropout=float(cfg.get("feature_adapter_dropout", 0.0)),
         use_ce=objective == "supcon_ce",
+        objective=objective,
     ).to(device)
     if world_size > 1:
         online: nn.Module = DDP(
@@ -1473,6 +1492,10 @@ def build_feature_adapter_system(
         betas=(
             float(cfg.get("feature_adapter_adam_b1", 0.9)),
             float(cfg.get("feature_adapter_adam_b2", 0.999)),
+        ),
+        fused=(
+            int(cfg.get("throughput_opt_level", 0)) >= 3
+            and device.type == "cuda"
         ),
     )
     return online, target, optimizer
@@ -1939,6 +1962,7 @@ def train_step(
     feature_adapter: Optional[nn.Module] = None,
     feature_adapter_target: Optional[FeatureAdapterSystem] = None,
     feature_adapter_optimizer: Optional[torch.optim.Optimizer] = None,
+    feature_adapter_update_allowed: bool = True,
     feature_discriminator: Optional[nn.Module] = None,
     feature_discriminator_optimizer: Optional[torch.optim.Optimizer] = None,
     historical_samples: Optional[torch.Tensor] = None,
@@ -2261,7 +2285,8 @@ def train_step(
     mae_use_bf16 = _mae_use_bf16(feature_extractor)
     real_stage_features: Dict[str, torch.Tensor] = {}
     need_terminal_stage_features = (
-        feature_adapter is not None or feature_discriminator is not None
+        feature_discriminator is not None
+        or (feature_adapter is not None and feature_adapter_update_allowed)
     )
     target_stage_adapters = (
         feature_adapter_target.adapters
@@ -2299,40 +2324,25 @@ def train_step(
 
     adapter_info: Dict[str, torch.Tensor] = {}
     adapter_updated = False
-    if feature_adapter is not None:
-        update_frequency = int(cfg.get("feature_adapter_update_freq", 1))
-        if update_frequency <= 0:
-            raise ValueError("feature_adapter_update_freq must be positive")
-        if step % update_frequency == 0:
-            feature_adapter.train()
-            feature_adapter_optimizer.zero_grad(set_to_none=True)
-            with _amp_ctx(mae_use_bf16):
-                adapter_loss, adapter_info = feature_adapter(
-                    real_stage_features,
-                    labels,
-                    batch_size=B,
-                    positive_count=P,
-                    samples_per_class=int(
-                        cfg.get("feature_adapter_samples_per_class", 8)
-                    ),
-                    temperature=float(cfg.get("feature_adapter_temp", 0.1)),
-                    supcon_weight=float(
-                        cfg.get("feature_adapter_loss_weight", 1.0)
-                    ),
-                    ce_weight=float(cfg.get("feature_adapter_ce_weight", 0.1)),
-                    reg_weight=float(cfg.get("feature_adapter_reg_lambda", 0.01)),
-                )
-            adapter_loss.backward()
-            adapter_grad_norm = nn.utils.clip_grad_norm_(
-                feature_adapter.parameters(),
-                float(cfg.get("feature_adapter_max_grad_norm", 1.0)),
-            )
-            feature_adapter_optimizer.step()
-            adapter_info["adapter/grad_norm"] = adapter_grad_norm.detach()
-            adapter_updated = True
-        if feature_discriminator is None:
-            del real_stage_features
-    _prof_mark("after_adapter_update")
+    adapter_objective = str(
+        cfg.get("feature_adapter_objective", "supcon")
+    ).lower().strip()
+    adapter_uses_generated = (
+        feature_adapter is not None
+        and adapter_objective == "gen_real_multipos_infonce"
+    )
+    if adapter_uses_generated and cfg_uncond_split:
+        raise ValueError(
+            "gen_real_multipos_infonce cannot use cfg_uncond_split because "
+            "mixed-class negatives would be mislabeled as class positives"
+        )
+    if adapter_uses_generated and bool(
+        cfg.get("feature_adapter_global_negatives", False)
+    ):
+        raise ValueError(
+            "feature_adapter_global_negatives=true is not implemented; use the "
+            "explicit rank-local candidate pool"
+        )
 
     # 3. Generate samples + compute their features (grad-enabled)
     expanded_labels = repeat(labels, "b -> (b g)", g=G)          # (B*G,)
@@ -2402,13 +2412,17 @@ def train_step(
         gen_samples_local = out["samples"]
         _prof_mark("after_generator")
         with _amp_ctx(mae_use_bf16):
+            need_generated_stage_features = (
+                feature_discriminator is not None
+                or (adapter_uses_generated and feature_adapter_update_allowed)
+            )
             activation_result = feature_extractor.get_activations(
                 gen_samples_local,
                 **act_kwargs,
                 stage_adapters=target_stage_adapters,
-                return_stage_features=feature_discriminator is not None,
+                return_stage_features=need_generated_stage_features,
             )
-        if feature_discriminator is not None:
+        if need_generated_stage_features:
             gen_feats_local, gen_stage_features_local = activation_result
         else:
             gen_feats_local = activation_result
@@ -2417,6 +2431,14 @@ def train_step(
         return gen_samples_local, gen_feats_local, gen_stage_features_local
 
     gen_samples, gen_feats, gen_stage_features = _forward_gen_and_feats()
+    adapter_generated_stage_features = (
+        {
+            name: feature.detach()
+            for name, feature in gen_stage_features.items()
+        }
+        if adapter_uses_generated and feature_adapter_update_allowed
+        else None
+    )
     history_ratio = _historical_replay_ratio_for_step(cfg, step, active=H > 0)
     configured_current_weight = cfg.get("historical_gen_current_weight", None)
     if configured_current_weight is not None:
@@ -2724,20 +2746,100 @@ def train_step(
             ),
             "feature_gan/calibrated": float(calibrate),
         }
-        del real_stage_features, gen_stage_features
+        if feature_adapter is None:
+            del real_stage_features, gen_stage_features
 
     total_generator_loss.backward()
     _prof_mark("after_backward")
 
     g_norm = nn.utils.clip_grad_norm_(generator.parameters(), max_grad_norm)
     optimizer.step()
+    _prof_mark("after_generator_optimizer")
+
+    # Alternate optimizers explicitly: the generator step above only sees the
+    # frozen target adapter.  The online adapter now learns from raw MAE maps;
+    # generated maps were detached before the generator backward, so this
+    # backward cannot update either the generator or frozen MAE.
+    if feature_adapter is not None:
+        update_frequency = int(cfg.get("feature_adapter_update_freq", 1))
+        if update_frequency <= 0:
+            raise ValueError("feature_adapter_update_freq must be positive")
+        if feature_adapter_update_allowed and step % update_frequency == 0:
+            feature_adapter.train()
+            feature_adapter_optimizer.zero_grad(set_to_none=True)
+            with _amp_ctx(mae_use_bf16):
+                adapter_loss, adapter_info = feature_adapter(
+                    real_stage_features,
+                    labels,
+                    batch_size=B,
+                    positive_count=P,
+                    samples_per_class=int(
+                        cfg.get("feature_adapter_samples_per_class", 8)
+                    ),
+                    temperature=float(cfg.get("feature_adapter_temp", 0.1)),
+                    supcon_weight=float(
+                        cfg.get("feature_adapter_loss_weight", 1.0)
+                    ),
+                    ce_weight=float(cfg.get("feature_adapter_ce_weight", 0.1)),
+                    reg_weight=float(cfg.get("feature_adapter_reg_lambda", 0.01)),
+                    generated_stage_features=adapter_generated_stage_features,
+                    generated_count=G if adapter_uses_generated else 0,
+                    generated_samples_per_class=int(
+                        cfg.get("feature_adapter_generated_samples_per_class", G)
+                    ),
+                    generated_anchor_weight=float(
+                        cfg.get("feature_adapter_generated_anchor_weight", 1.0)
+                    ),
+                    real_anchor_weight=float(
+                        cfg.get("feature_adapter_real_anchor_weight", 0.0)
+                    ),
+                )
+            adapter_loss.backward()
+            adapter_grad_norm = nn.utils.clip_grad_norm_(
+                feature_adapter.parameters(),
+                float(cfg.get("feature_adapter_max_grad_norm", 1.0)),
+            )
+            feature_adapter_optimizer.step()
+            adapter_info["adapter/grad_norm"] = adapter_grad_norm.detach()
+            adapter_info["adapter/real_samples_per_class"] = torch.tensor(
+                min(int(cfg.get("feature_adapter_samples_per_class", 8)), P),
+                device=device,
+                dtype=torch.float32,
+            )
+            adapter_info["adapter/generated_samples_per_class"] = torch.tensor(
+                (
+                    min(
+                        int(
+                            cfg.get(
+                                "feature_adapter_generated_samples_per_class", G
+                            )
+                        ),
+                        G,
+                    )
+                    if adapter_uses_generated
+                    else 0
+                ),
+                device=device,
+                dtype=torch.float32,
+            )
+            adapter_updated = True
+        adapter_info["adapter/update_allowed"] = torch.tensor(
+            float(feature_adapter_update_allowed),
+            device=device,
+            dtype=torch.float32,
+        )
+        adapter_info["adapter/updated"] = torch.tensor(
+            float(adapter_updated),
+            device=device,
+            dtype=torch.float32,
+        )
     if adapter_updated:
         update_adapter_ema(
             feature_adapter_target,
             feature_adapter,
             float(cfg.get("feature_adapter_ema_decay", 0.999)),
         )
-    _prof_mark("after_optimizer")
+    _prof_mark("after_adapter_update")
 
     metrics = {"drift_matching": drift_matching}
     if collect_training_metrics:
@@ -3266,6 +3368,24 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     push_at_resume = int(cfg.get("push_at_resume", 3000))
     pos_per_sample = int(cfg.get("pos_per_sample", 64))
     neg_per_sample = int(cfg.get("neg_per_sample", 32))
+    adapter_requires_distinct_real = bool(
+        feature_adapter is not None
+        and str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
+        == "gen_real_multipos_infonce"
+        and cfg.get("feature_adapter_require_distinct_real", False)
+    )
+    adapter_distinct_real_count = int(
+        cfg.get("feature_adapter_samples_per_class", 8)
+    )
+    if (
+        adapter_requires_distinct_real
+        and positive_bank_size < adapter_distinct_real_count
+    ):
+        raise ValueError(
+            "positive_bank_size must be at least feature_adapter_samples_per_class "
+            "when distinct real positives are required"
+        )
+    adapter_real_bank_ready = not adapter_requires_distinct_real
 
     # --- Mix-alpha tracker ---
     # Always created so per-step α1/β1 are logged for every config (rev-drift,
@@ -3426,9 +3546,21 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 f"objective={cfg.get('feature_adapter_objective', 'supcon')} "
                 f"stages={','.join(raw_adapter.stages)} "
                 f"bottleneck={int(cfg.get('feature_adapter_bottleneck', 64))} "
-                f"samples_per_class={int(cfg.get('feature_adapter_samples_per_class', 8))} "
+                f"real_samples_per_class={int(cfg.get('feature_adapter_samples_per_class', 8))} "
+                "generated_samples_per_class="
+                f"{int(cfg.get('feature_adapter_generated_samples_per_class', cfg.get('gen_per_label', 64)))} "
+                "generated_anchor_weight="
+                f"{float(cfg.get('feature_adapter_generated_anchor_weight', 1.0)):g} "
+                "real_anchor_weight="
+                f"{float(cfg.get('feature_adapter_real_anchor_weight', 0.0)):g} "
+                "contrastive_scope="
+                f"{'global' if bool(cfg.get('feature_adapter_global_negatives', False)) else 'rank_local'} "
+                "require_distinct_real="
+                f"{str(adapter_requires_distinct_real).lower()} "
                 f"lr={float(cfg.get('feature_adapter_lr', 1.0e-4)):g} "
-                f"ema={float(cfg.get('feature_adapter_ema_decay', 0.999)):g} "
+                f"target_ema={float(cfg.get('feature_adapter_ema_decay', 0.999)):g} "
+                "direct_adapted_features="
+                f"{str(raw_adapter.objective == 'gen_real_multipos_infonce').lower()} "
                 f"parameters={trainable_parameters}"
             )
         if feature_discriminator is None:
@@ -3874,6 +4006,23 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             if n_pushed >= push_goal:
                 break
 
+        if not adapter_real_bank_ready:
+            local_adapter_bank_ready = all(
+                bank.is_ready(adapter_distinct_real_count) for bank in pos_banks
+            )
+            ready_tensor = torch.tensor(
+                int(local_adapter_bank_ready), device=device, dtype=torch.int32
+            )
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(ready_tensor, op=dist.ReduceOp.MIN)
+            adapter_real_bank_ready = bool(ready_tensor.item())
+            if adapter_real_bank_ready and is_main_process(rank):
+                print(
+                    "[feature-adapter] distinct-real bank ready; enabling updates "
+                    f"with {adapter_distinct_real_count} unique entries per class",
+                    flush=True,
+                )
+
         # --- Sample batch labels from the latest pushed batch, matching official JAX. ---
         labels_parts: List[np.ndarray] = []
         pos_parts: List[torch.Tensor] = []
@@ -4035,6 +4184,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             feature_adapter=feature_adapter,
             feature_adapter_target=feature_adapter_target,
             feature_adapter_optimizer=feature_adapter_optimizer,
+            feature_adapter_update_allowed=adapter_real_bank_ready,
             feature_discriminator=feature_discriminator,
             feature_discriminator_optimizer=feature_discriminator_optimizer,
             historical_samples=historical_smp,

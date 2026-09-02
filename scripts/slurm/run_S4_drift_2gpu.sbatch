@@ -95,6 +95,26 @@ if cfg.get("cache_path") != os.environ["IDRIFT_EXPECTED_CACHE_PATH"]:
     )
 if not bool(cfg.get("use_wandb", False)):
     raise SystemExit("pre-opt S/4 preflight failed: W&B logging is disabled")
+if bool(cfg.get("feature_adapter", False)):
+    adapter_expected = {
+        "feature_adapter_objective": "gen_real_multipos_infonce",
+        "feature_adapter_samples_per_class": 32,
+        "feature_adapter_generated_samples_per_class": 32,
+        "feature_adapter_generated_anchor_weight": 1.0,
+        "feature_adapter_real_anchor_weight": 0.0,
+        "feature_adapter_global_negatives": False,
+        "feature_adapter_require_distinct_real": True,
+        "feature_adapter_reg_lambda": 0.0,
+        "feature_adapter_weight_decay": 0.0,
+        "feature_adapter_ema_decay": 0.0,
+    }
+    for key, value in adapter_expected.items():
+        if cfg.get(key) != value:
+            raise SystemExit(
+                f"adapter preflight failed: {key}={cfg.get(key)!r}, expected {value!r}"
+            )
+    if list(cfg.get("feature_adapter_keys", [])) != ["layer3", "layer4"]:
+        raise SystemExit("adapter preflight failed: keys must be [layer3, layer4]")
 print(
     "[preflight] matched S/4 pre-opt: B4 P32 N32 G32, manual attention, "
     "TF32=false, cuDNN benchmark=false, drift features=stage3+stage4, W&B=true",
@@ -110,6 +130,7 @@ RUNTIME_SOURCE_FILES=(
   "drifting_core/imagenet_loss.py"
   "memory_bank.py"
   "models/imagenet_generator.py"
+  "models/feature_adapter.py"
   "models/mae_resnet.py"
   "train/train_data.py"
   "train_imagenet_gen.py"
