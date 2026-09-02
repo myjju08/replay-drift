@@ -96,18 +96,43 @@ if cfg.get("cache_path") != os.environ["IDRIFT_EXPECTED_CACHE_PATH"]:
 if not bool(cfg.get("use_wandb", False)):
     raise SystemExit("pre-opt S/4 preflight failed: W&B logging is disabled")
 if bool(cfg.get("feature_adapter", False)):
-    adapter_expected = {
-        "feature_adapter_objective": "gen_real_multipos_infonce",
-        "feature_adapter_samples_per_class": 32,
-        "feature_adapter_generated_samples_per_class": 32,
-        "feature_adapter_generated_anchor_weight": 1.0,
-        "feature_adapter_real_anchor_weight": 0.0,
-        "feature_adapter_global_negatives": False,
-        "feature_adapter_require_distinct_real": True,
-        "feature_adapter_reg_lambda": 0.0,
-        "feature_adapter_weight_decay": 0.0,
-        "feature_adapter_ema_decay": 0.0,
-    }
+    objective = cfg.get("feature_adapter_objective")
+    if objective == "gen_real_multipos_infonce":
+        adapter_expected = {
+            "feature_adapter_objective": "gen_real_multipos_infonce",
+            "feature_adapter_samples_per_class": 32,
+            "feature_adapter_generated_samples_per_class": 32,
+            "feature_adapter_drift_query_count": 8,
+            "feature_adapter_drift_bank_count": 12,
+            "feature_adapter_generated_anchor_weight": 1.0,
+            "feature_adapter_real_anchor_weight": 0.0,
+            "feature_adapter_global_negatives": False,
+            "feature_adapter_require_distinct_real": True,
+            "feature_adapter_reg_lambda": 0.0,
+            "feature_adapter_weight_decay": 0.0,
+            "feature_adapter_ema_decay": 0.0,
+        }
+    elif objective == "raw_drift_snr":
+        adapter_expected = {
+            "feature_adapter_objective": "raw_drift_snr",
+            "feature_adapter_samples_per_class": 32,
+            "feature_adapter_generated_samples_per_class": 32,
+            "feature_adapter_global_negatives": False,
+            "feature_adapter_require_distinct_real": True,
+            "feature_adapter_reg_lambda": 0.0,
+            "feature_adapter_weight_decay": 0.0,
+            "feature_adapter_lr": 0.00002,
+            "feature_adapter_update_freq": 4,
+            "feature_adapter_ema_decay": 0.999,
+            "feature_adapter_drift_consistency_weight": 0.25,
+            "feature_adapter_drift_variance_epsilon": 0.000001,
+            "feature_adapter_drift_global_scale_stats": False,
+            "feature_adapter_freeze_after_generated_epochs": 30.0,
+        }
+        if int(cfg.get("drift_top_k_pos", 0)) != 0 or int(cfg.get("drift_top_k_neg", 0)) != 0:
+            raise SystemExit("raw-drift adapter preflight failed: dense top-k=0 is required")
+    else:
+        raise SystemExit(f"adapter preflight failed: unsupported objective={objective!r}")
     for key, value in adapter_expected.items():
         if cfg.get(key) != value:
             raise SystemExit(

@@ -83,6 +83,75 @@ def safe_mean_std(
     return mean.to(x.dtype), (var.clamp_min(0.0) + eps).sqrt()
 
 
+def activations_from_feature_map(
+    name: str,
+    feat: torch.Tensor,
+    *,
+    patch_mean_size: Optional[List[int]] = None,
+    patch_std_size: Optional[List[int]] = None,
+    use_std: bool = True,
+    use_mean: bool = True,
+    fuse_stats: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Build the exact drift activations derived from one BCHW feature map.
+
+    This is shared by :meth:`MAEResNet.get_activations` and the separately
+    optimized feature adapter. Keeping the transformation in one place makes
+    the adapter raw-field objective operate on precisely the same token,
+    global-statistic, and patch-statistic features as the generator drift.
+    """
+    if feat.ndim != 4:
+        raise ValueError(f"feature map must be BCHW, got {tuple(feat.shape)}")
+    if patch_mean_size is None:
+        patch_mean_size = [2, 4]
+    if patch_std_size is None:
+        patch_std_size = [2, 4]
+
+    _, _, height, width = feat.shape
+    out: Dict[str, torch.Tensor] = {
+        name: rearrange(feat, "b c h w -> b (h w) c")
+    }
+    if fuse_stats and use_mean and use_std:
+        mean, std = safe_mean_std(feat, dim=(2, 3))
+        out[f"{name}_mean"] = mean.unsqueeze(1)
+        out[f"{name}_std"] = std.unsqueeze(1)
+    else:
+        if use_mean:
+            out[f"{name}_mean"] = safe_mean(feat, dim=(2, 3)).unsqueeze(1)
+        if use_std:
+            out[f"{name}_std"] = safe_std(feat, dim=(2, 3)).unsqueeze(1)
+
+    cached_patch_std: Dict[int, torch.Tensor] = {}
+    for size in patch_mean_size:
+        if height % size == 0 and width % size == 0:
+            patches = rearrange(
+                feat,
+                "b c (h s1) (w s2) -> b (h w) (s1 s2) c",
+                s1=size,
+                s2=size,
+            )
+            if fuse_stats and use_std and size in patch_std_size:
+                mean, std = safe_mean_std(patches, dim=2)
+                out[f"{name}_mean_{size}"] = mean
+                cached_patch_std[size] = std
+            else:
+                out[f"{name}_mean_{size}"] = safe_mean(patches, dim=2)
+
+    for size in patch_std_size:
+        if height % size == 0 and width % size == 0:
+            if size in cached_patch_std:
+                out[f"{name}_std_{size}"] = cached_patch_std[size]
+            else:
+                patches = rearrange(
+                    feat,
+                    "b c (h s1) (w s2) -> b (h w) (s1 s2) c",
+                    s1=size,
+                    s2=size,
+                )
+                out[f"{name}_std_{size}"] = safe_std(patches, dim=2)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Encoder building blocks
 # ---------------------------------------------------------------------------
@@ -417,6 +486,7 @@ class MAEResNet(nn.Module):
         every_k_block: float = 2,
         stage_adapters: Optional[nn.ModuleDict] = None,
         return_stage_features: bool = False,
+        return_all_stage_features: bool = False,
         active_stages: Optional[List[str]] = None,
     ) -> Dict[str, torch.Tensor] | Tuple[
         Dict[str, torch.Tensor], Dict[str, torch.Tensor]
@@ -487,6 +557,11 @@ class MAEResNet(nn.Module):
         # Keep epsilon to avoid sqrt(0) -> inf gradient at exactly-zero activations.
         out["norm_x"] = safe_rms(x_patched, dim=(2, 3)).unsqueeze(1)
 
+        if return_all_stage_features and not return_stage_features:
+            raise ValueError(
+                "return_all_stage_features requires return_stage_features=true"
+            )
+
         def process_feat(name: str, feat: torch.Tensor) -> None:
             stage = None
             for stage_index in range(1, 5):
@@ -496,44 +571,21 @@ class MAEResNet(nn.Module):
                     break
             if stage is not None and stage not in selected_stage_set:
                 return
+            if return_all_stage_features and stage is not None:
+                adapter_inputs[name] = feat
             if stage_adapters is not None and stage in stage_adapters:
                 feat = stage_adapters[stage](feat)
-            # feat: (B, C, H, W) → tokens (B, H*W, C)
-            B, C, H, W = feat.shape
-            out[name] = rearrange(feat, "b c h w -> b (h w) c")
-
-            if self.fuse_stats and use_mean and use_std:
-                mean, std = safe_mean_std(feat, dim=(2, 3))
-                out[f"{name}_mean"] = mean.unsqueeze(1)  # (B, 1, C)
-                out[f"{name}_std"] = std.unsqueeze(1)    # (B, 1, C)
-            else:
-                if use_mean:
-                    out[f"{name}_mean"] = safe_mean(feat, dim=(2, 3)).unsqueeze(1)
-                if use_std:
-                    out[f"{name}_std"] = safe_std(feat, dim=(2, 3)).unsqueeze(1)
-
-            cached_patch_std: Dict[int, torch.Tensor] = {}
-            for size in patch_mean_size:
-                if H % size == 0 and W % size == 0:
-                    patches = rearrange(
-                        feat, "b c (h s1) (w s2) -> b (h w) (s1 s2) c", s1=size, s2=size
-                    )
-                    if self.fuse_stats and use_std and size in patch_std_size:
-                        mean, std = safe_mean_std(patches, dim=2)
-                        out[f"{name}_mean_{size}"] = mean
-                        cached_patch_std[size] = std
-                    else:
-                        out[f"{name}_mean_{size}"] = safe_mean(patches, dim=2)
-
-            for size in patch_std_size:
-                if H % size == 0 and W % size == 0:
-                    if size in cached_patch_std:
-                        out[f"{name}_std_{size}"] = cached_patch_std[size]
-                    else:
-                        patches = rearrange(
-                            feat, "b c (h s1) (w s2) -> b (h w) (s1 s2) c", s1=size, s2=size
-                        )
-                        out[f"{name}_std_{size}"] = safe_std(patches, dim=2)
+            out.update(
+                activations_from_feature_map(
+                    name,
+                    feat,
+                    patch_mean_size=patch_mean_size,
+                    patch_std_size=patch_std_size,
+                    use_std=use_std,
+                    use_mean=use_mean,
+                    fuse_stats=self.fuse_stats,
+                )
+            )
 
         if return_stage_features:
             adapter_inputs = {
@@ -627,4 +679,10 @@ def build_mae_from_config(config: dict) -> MAEResNet:
     )
 
 
-__all__ = ["MAEResNet", "build_mae_from_config", "patch_input", "make_patch_mask"]
+__all__ = [
+    "MAEResNet",
+    "activations_from_feature_map",
+    "build_mae_from_config",
+    "patch_input",
+    "make_patch_mask",
+]

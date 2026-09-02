@@ -443,9 +443,11 @@ from tqdm import tqdm
 from drifting_core.imagenet_loss import (
     _cdist_batched,
     compute_raw_winner_stats,
+    detached_reverse_drift_scale,
     drift_loss_imagenet,
     drift_loss_imagenet_colwise,
     drift_loss_imagenet_mixed,
+    raw_reverse_drift_fields,
 )
 from drifting_core.topk_diagnostics import diagnose_reverse_topk_heterogeneity
 from memory_bank import ArrayMemoryBank
@@ -461,7 +463,11 @@ from models.feature_gan import (
     generator_hinge_loss,
 )
 from models.imagenet_generator import DitGen, build_ditgen_from_config
-from models.mae_resnet import MAEResNet, build_mae_from_config
+from models.mae_resnet import (
+    MAEResNet,
+    activations_from_feature_map,
+    build_mae_from_config,
+)
 from train.train_data import create_imagenet_split, infinite_sampler
 from utils import EMA
 
@@ -1444,10 +1450,11 @@ def build_feature_adapter_system(
         "supcon",
         "supcon_ce",
         "gen_real_multipos_infonce",
+        "raw_drift_snr",
     ):
         raise ValueError(
             "feature_adapter_objective must be 'supcon', 'supcon_ce', or "
-            "'gen_real_multipos_infonce', "
+            "'gen_real_multipos_infonce', or 'raw_drift_snr', "
             f"got {objective!r}"
         )
     stages = canonical_adapter_stages(
@@ -1910,6 +1917,388 @@ def compute_drift_loss_from_features(
     return total_loss, total_info
 
 
+def _adapter_activations_from_maps(
+    maps: Dict[str, torch.Tensor],
+    activation_kwargs: Dict[str, Any],
+    *,
+    fuse_stats: bool,
+) -> Dict[str, torch.Tensor]:
+    """Apply the MAE's exact derived-activation transform to adapted maps."""
+    out: Dict[str, torch.Tensor] = {}
+    for name, feature_map in maps.items():
+        out.update(
+            activations_from_feature_map(
+                name,
+                feature_map,
+                patch_mean_size=activation_kwargs.get("patch_mean_size", [2, 4]),
+                patch_std_size=activation_kwargs.get("patch_std_size", [2, 4]),
+                use_std=bool(activation_kwargs.get("use_std", True)),
+                use_mean=bool(activation_kwargs.get("use_mean", True)),
+                fuse_stats=bool(fuse_stats),
+            )
+        )
+    return out
+
+
+def compute_adapter_raw_drift_snr_loss(
+    online_gen_feats: Dict[str, torch.Tensor],
+    online_pos_feats: Dict[str, torch.Tensor],
+    target_gen_feats: Dict[str, torch.Tensor],
+    target_pos_feats: Dict[str, torch.Tensor],
+    *,
+    batch_size: int,
+    generated_count: int,
+    positive_count: int,
+    query_count: int,
+    bank_count: int,
+    partition_seed: int,
+    R_list: Tuple[float, ...],
+    signal_weight: float,
+    consistency_weight: float,
+    variance_epsilon: float,
+    cosine_epsilon: float,
+    global_scale_stats: bool,
+    top_p: float,
+    top_p_min_keep: int,
+    top_k_pos: int,
+    top_k_neg: int,
+    affinity_kernel: str,
+    kernel_shape: float,
+    kernel_mix_weight: float,
+    kernel_temperature_mix: Tuple[float, ...],
+    kernel_temperature_mix_weights: Tuple[float, ...],
+    feature_temperature_multipliers: Optional[Dict[str, float]] = None,
+    feature_loss_weights: Optional[Dict[str, float]] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Optimize raw drift signal-to-null-noise plus EMA bank consistency.
+
+    Each class-local set is split with a resume-stable permutation into an
+    independent generated query set plus real/generated banks ``a`` and ``b``.
+    Cross fields use ``(P_a,Q_a)`` and ``(P_b,Q_b)``; null fields use
+    ``(P_a,P_b)`` and ``(Q_a,Q_b)`` under exactly the same query measure and one
+    shared detached distance scale. Crucially, this function consumes the raw
+    per-temperature fields returned before force-RMS normalization.
+    normalization, so field energy is not an identity constant.
+    """
+    B = int(batch_size)
+    G = int(generated_count)
+    P = int(positive_count)
+    query_count = int(query_count)
+    bank_count = int(bank_count)
+    if B <= 0 or query_count <= 0 or bank_count < 2:
+        raise ValueError(
+            "raw drift SNR requires a positive batch/query count and banks of "
+            "at least two samples"
+        )
+    if query_count + 2 * bank_count > G or 2 * bank_count > P:
+        raise ValueError(
+            "raw drift query/banks do not fit the configured samples: "
+            f"query={query_count}, bank={bank_count}, G={G}, P={P}"
+        )
+    if not math.isfinite(float(signal_weight)) or float(signal_weight) < 0.0:
+        raise ValueError("raw drift signal weight must be finite and non-negative")
+    if (
+        not math.isfinite(float(consistency_weight))
+        or float(consistency_weight) < 0.0
+    ):
+        raise ValueError(
+            "raw drift consistency weight must be finite and non-negative"
+        )
+    if not math.isfinite(float(variance_epsilon)) or float(variance_epsilon) <= 0.0:
+        raise ValueError("raw drift variance epsilon must be finite and positive")
+    if not math.isfinite(float(cosine_epsilon)) or float(cosine_epsilon) <= 0.0:
+        raise ValueError("raw drift cosine epsilon must be finite and positive")
+    if int(top_k_pos) > 0 or int(top_k_neg) > 0:
+        raise ValueError(
+            "raw drift SNR currently requires dense banks (top-k=0) because "
+            "the compact indexed reduction has no adapter backward"
+        )
+
+    feature_names = tuple(online_gen_feats.keys())
+    if not feature_names:
+        raise ValueError("raw drift SNR received no adapter activations")
+    missing = {
+        name
+        for name in feature_names
+        if name not in online_pos_feats
+        or name not in target_gen_feats
+        or name not in target_pos_feats
+    }
+    if missing:
+        raise KeyError(f"raw drift SNR is missing matching features: {sorted(missing)}")
+
+    feature_device = next(iter(online_gen_feats.values())).device
+    partition_generator = torch.Generator(device="cpu")
+    partition_generator.manual_seed(int(partition_seed) % (2**63 - 1))
+    generated_permutation = torch.randperm(
+        G, generator=partition_generator, device="cpu"
+    ).to(feature_device)
+    partition_generator.manual_seed((int(partition_seed) + 104729) % (2**63 - 1))
+    positive_permutation = torch.randperm(
+        P, generator=partition_generator, device="cpu"
+    ).to(feature_device)
+    query_idx = generated_permutation[:query_count]
+    gen_a_idx = generated_permutation[
+        query_count : query_count + bank_count
+    ]
+    gen_b_idx = generated_permutation[
+        query_count + bank_count : query_count + 2 * bank_count
+    ]
+    pos_a_idx = positive_permutation[:bank_count]
+    pos_b_idx = positive_permutation[bank_count : 2 * bank_count]
+
+    weighted_j = next(iter(online_gen_feats.values())).new_zeros((), dtype=torch.float32)
+    weighted_consistency = weighted_j.clone()
+    weighted_dpq = weighted_j.clone()
+    weighted_d0 = weighted_j.clone()
+    weighted_var0 = weighted_j.clone()
+    weighted_signal = weighted_j.clone()
+    weighted_std0 = weighted_j.clone()
+    weighted_variance_floor = weighted_j.clone()
+    weighted_null_real = weighted_j.clone()
+    weighted_null_generated = weighted_j.clone()
+    weighted_near_zero = weighted_j.clone()
+    total_weight = 0.0
+    term_count = 0
+
+    common_field_kwargs = {
+        "global_scale_stats": bool(global_scale_stats),
+        "top_p": float(top_p),
+        "top_p_min_keep": int(top_p_min_keep),
+        "top_k_pos": int(top_k_pos),
+        "top_k_neg": int(top_k_neg),
+        "affinity_kernel": affinity_kernel,
+        "kernel_shape": float(kernel_shape),
+        "kernel_mix_weight": float(kernel_mix_weight),
+        "kernel_temperature_mix": kernel_temperature_mix,
+        "kernel_temperature_mix_weights": kernel_temperature_mix_weights,
+    }
+
+    for name in feature_names:
+        feature_weight = (
+            float(feature_loss_weights.get(name, 1.0))
+            if feature_loss_weights is not None
+            else 1.0
+        )
+        if feature_weight <= 0.0:
+            continue
+        online_gen = online_gen_feats[name]
+        online_pos = online_pos_feats[name]
+        target_gen = target_gen_feats[name].detach()
+        target_pos = target_pos_feats[name].detach()
+        if online_gen.ndim != 3 or online_pos.ndim != 3:
+            raise ValueError(f"adapter activation {name} must have shape [B*X,T,D]")
+        token_count = online_gen.shape[1]
+        feature_dim = online_gen.shape[2]
+        expected_gen = B * G
+        expected_pos = B * P
+        expected_shapes = (
+            (online_gen, expected_gen, "online generated"),
+            (online_pos, expected_pos, "online positive"),
+            (target_gen, expected_gen, "target generated"),
+            (target_pos, expected_pos, "target positive"),
+        )
+        for tensor, expected_examples, description in expected_shapes:
+            if (
+                tensor.shape[0] != expected_examples
+                or tensor.shape[1] != token_count
+                or tensor.shape[2] != feature_dim
+            ):
+                raise ValueError(
+                    f"{description} {name} has shape {tuple(tensor.shape)}; "
+                    f"expected ({expected_examples}, {token_count}, {feature_dim})"
+                )
+
+        def _to_bt(tensor: torch.Tensor, count: int) -> torch.Tensor:
+            return rearrange(
+                rearrange(tensor, "(b x) t d -> b x t d", b=B, x=count),
+                "b x t d -> (b t) x d",
+            )
+
+        online_generated_all = _to_bt(online_gen, G)
+        online_real = _to_bt(online_pos, P)
+        target_generated_all = _to_bt(target_gen, G)
+        target_real = _to_bt(target_pos, P)
+        online_query = online_generated_all.index_select(1, query_idx)
+        online_q_a = online_generated_all.index_select(1, gen_a_idx)
+        online_q_b = online_generated_all.index_select(1, gen_b_idx)
+        online_p_a = online_real.index_select(1, pos_a_idx)
+        online_p_b = online_real.index_select(1, pos_b_idx)
+        target_query = target_generated_all.index_select(1, query_idx)
+        target_q_a = target_generated_all.index_select(1, gen_a_idx)
+        target_q_b = target_generated_all.index_select(1, gen_b_idx)
+        target_p_a = target_real.index_select(1, pos_a_idx)
+        target_p_b = target_real.index_select(1, pos_b_idx)
+
+        temperature_multiplier = _feature_temperature_multiplier(
+            name, feature_temperature_multipliers
+        )
+        feature_R_list = tuple(
+            round(float(R) * temperature_multiplier, 12) for R in R_list
+        )
+        shared_distance_scale = detached_reverse_drift_scale(
+            online_query,
+            (online_p_a, online_p_b, online_q_a, online_q_b),
+            global_scale_stats=bool(global_scale_stats),
+        )
+        feature_field_kwargs = {
+            **common_field_kwargs,
+            "distance_scale": shared_distance_scale,
+        }
+        cross_a, _ = raw_reverse_drift_fields(
+            online_query,
+            online_p_a,
+            online_q_a,
+            R_list=feature_R_list,
+            **feature_field_kwargs,
+        )
+        cross_b, _ = raw_reverse_drift_fields(
+            online_query,
+            online_p_b,
+            online_q_b,
+            R_list=feature_R_list,
+            **feature_field_kwargs,
+        )
+        null_real, _ = raw_reverse_drift_fields(
+            online_query,
+            online_p_a,
+            online_p_b,
+            R_list=feature_R_list,
+            **feature_field_kwargs,
+        )
+        null_generated, _ = raw_reverse_drift_fields(
+            online_query,
+            online_q_a,
+            online_q_b,
+            R_list=feature_R_list,
+            **feature_field_kwargs,
+        )
+        with torch.no_grad():
+            target_distance_scale = detached_reverse_drift_scale(
+                target_query,
+                (target_p_a, target_p_b, target_q_a, target_q_b),
+                global_scale_stats=bool(global_scale_stats),
+            )
+            target_field_kwargs = {
+                **common_field_kwargs,
+                "distance_scale": target_distance_scale,
+            }
+            target_cross_b, _ = raw_reverse_drift_fields(
+                target_query,
+                target_p_b,
+                target_q_b,
+                R_list=feature_R_list,
+                **target_field_kwargs,
+            )
+
+        for field_a, field_b, field_rr, field_qq, field_target in zip(
+            cross_a,
+            cross_b,
+            null_real,
+            null_generated,
+            target_cross_b,
+        ):
+            energy_a = field_a.float().square().mean(dim=-1)
+            energy_b = field_b.float().square().mean(dim=-1)
+            energy_rr = field_rr.float().square().mean(dim=-1)
+            energy_qq = field_qq.float().square().mean(dim=-1)
+            dpq = 0.5 * (energy_a.mean() + energy_b.mean())
+            null_rr_mean = energy_rr.mean()
+            null_qq_mean = energy_qq.mean()
+            d0 = 0.5 * (null_rr_mean + null_qq_mean)
+            # Pooled finite-sample null variance around D0. Keeping this
+            # differentiable lets the adapter reduce estimator variance rather
+            # than merely enlarging cross-distribution field magnitude.
+            null_observation_count = energy_rr.numel() + energy_qq.numel()
+            var0 = (
+                (energy_rr - d0).square().sum()
+                + (energy_qq - d0).square().sum()
+            ) / float(max(1, null_observation_count - 1))
+            drift_signal = dpq - d0
+            drift_std0 = (var0 + float(variance_epsilon)).sqrt()
+            j_drift = drift_signal / drift_std0
+            with torch.no_grad():
+                near_zero_threshold = float(cosine_epsilon) ** 2
+                near_zero = 0.5 * (
+                    field_a.float()
+                    .square()
+                    .sum(dim=-1)
+                    .le(near_zero_threshold)
+                    .float()
+                    .mean()
+                    + field_target.float()
+                    .square()
+                    .sum(dim=-1)
+                    .le(near_zero_threshold)
+                    .float()
+                    .mean()
+                )
+                variance_floor_active = var0.le(float(variance_epsilon)).float()
+            direction_cosine = F.cosine_similarity(
+                field_a.float(),
+                field_target.detach().float(),
+                dim=-1,
+                eps=float(cosine_epsilon),
+            ).mean()
+            consistency = 1.0 - direction_cosine
+            weighted_j = weighted_j + feature_weight * j_drift
+            weighted_consistency = (
+                weighted_consistency + feature_weight * consistency
+            )
+            weighted_dpq = weighted_dpq + feature_weight * dpq
+            weighted_d0 = weighted_d0 + feature_weight * d0
+            weighted_var0 = weighted_var0 + feature_weight * var0
+            weighted_signal = weighted_signal + feature_weight * drift_signal
+            weighted_std0 = weighted_std0 + feature_weight * drift_std0
+            weighted_variance_floor = (
+                weighted_variance_floor
+                + feature_weight * variance_floor_active
+            )
+            weighted_null_real = (
+                weighted_null_real + feature_weight * null_rr_mean
+            )
+            weighted_null_generated = (
+                weighted_null_generated + feature_weight * null_qq_mean
+            )
+            weighted_near_zero = weighted_near_zero + feature_weight * near_zero
+            total_weight += feature_weight
+            term_count += 1
+
+    if total_weight <= 0.0 or term_count <= 0:
+        raise ValueError("raw drift SNR has no positive-weight feature/scale terms")
+    normalizer = float(total_weight)
+    mean_j = weighted_j / normalizer
+    mean_consistency = weighted_consistency / normalizer
+    loss = (
+        -float(signal_weight) * mean_j
+        + float(consistency_weight) * mean_consistency
+    )
+    metrics = {
+        "adapter/loss": loss.detach(),
+        "adapter/drift_snr": mean_j.detach(),
+        "adapter/drift_consistency": mean_consistency.detach(),
+        "adapter/drift_dpq": (weighted_dpq / normalizer).detach(),
+        "adapter/drift_d0": (weighted_d0 / normalizer).detach(),
+        "adapter/drift_var0": (weighted_var0 / normalizer).detach(),
+        "adapter/drift_signal": (weighted_signal / normalizer).detach(),
+        "adapter/drift_std0": (weighted_std0 / normalizer).detach(),
+        "adapter/drift_variance_floor_fraction": (
+            weighted_variance_floor / normalizer
+        ).detach(),
+        "adapter/drift_null_real": (weighted_null_real / normalizer).detach(),
+        "adapter/drift_null_generated": (
+            weighted_null_generated / normalizer
+        ).detach(),
+        "adapter/drift_direction_near_zero_fraction": (
+            weighted_near_zero / normalizer
+        ).detach(),
+        "adapter/drift_feature_scale_terms": loss.new_tensor(float(term_count)),
+        "adapter/drift_query_count": loss.new_tensor(float(query_count)),
+        "adapter/drift_bank_count": loss.new_tensor(float(bank_count)),
+    }
+    return loss, metrics
+
+
 
 # ---------------------------------------------------------------------------
 # Training step
@@ -2012,6 +2401,33 @@ def train_step(
         raise ValueError(
             "feature adapter, EMA target, and optimizer must be provided together"
         )
+    adapter_objective = str(
+        cfg.get("feature_adapter_objective", "supcon")
+    ).lower().strip()
+    adapter_uses_generated = bool(
+        feature_adapter is not None
+        and adapter_objective
+        in ("gen_real_multipos_infonce", "raw_drift_snr")
+    )
+    adapter_uses_raw_drift = bool(
+        feature_adapter is not None and adapter_objective == "raw_drift_snr"
+    )
+    adapter_stage_names: Tuple[str, ...] = ()
+    if feature_adapter is not None:
+        raw_adapter_module = (
+            feature_adapter.module
+            if hasattr(feature_adapter, "module")
+            else feature_adapter
+        )
+        adapter_stage_names = tuple(raw_adapter_module.stages)
+    adapter_update_frequency = int(cfg.get("feature_adapter_update_freq", 1))
+    if feature_adapter is not None and adapter_update_frequency <= 0:
+        raise ValueError("feature_adapter_update_freq must be positive")
+    adapter_update_this_step = bool(
+        feature_adapter is not None
+        and feature_adapter_update_allowed
+        and step % adapter_update_frequency == 0
+    )
     discriminator_parts = (
         feature_discriminator,
         feature_discriminator_optimizer,
@@ -2235,6 +2651,13 @@ def train_step(
         P = P + x
         N = N - x
 
+    adapter_real_take = min(
+        int(cfg.get("feature_adapter_samples_per_class", 8)), P
+    )
+    adapter_generated_take = min(
+        int(cfg.get("feature_adapter_generated_samples_per_class", G)), G
+    )
+
     # Matched-geometry causal control for historical replay. Generate H
     # independent targets from the current generator, but isolate their RNG so
     # the G query particles use the same random stream as the other controls.
@@ -2286,7 +2709,10 @@ def train_step(
     real_stage_features: Dict[str, torch.Tensor] = {}
     need_terminal_stage_features = (
         feature_discriminator is not None
-        or (feature_adapter is not None and feature_adapter_update_allowed)
+        or adapter_update_this_step
+    )
+    need_all_adapter_stage_features = bool(
+        adapter_uses_raw_drift and adapter_update_this_step
     )
     target_stage_adapters = (
         feature_adapter_target.adapters
@@ -2299,6 +2725,7 @@ def train_step(
             **act_kwargs,
             stage_adapters=target_stage_adapters,
             return_stage_features=need_terminal_stage_features,
+            return_all_stage_features=need_all_adapter_stage_features,
         )
         if need_terminal_stage_features:
             all_real_feats, real_stage_features = real_activation_result
@@ -2322,21 +2749,26 @@ def train_step(
 
     _prof_mark("after_real_mae")
 
+    adapter_target_pos_features: Dict[str, torch.Tensor] = {}
+    if adapter_uses_raw_drift and adapter_update_this_step:
+        for name, value in pos_feats.items():
+            if _feature_stage_group(name) not in adapter_stage_names:
+                continue
+            selected = value.reshape(B, P, *value.shape[1:])[
+                :, :adapter_real_take
+            ]
+            adapter_target_pos_features[name] = selected.reshape(
+                B * adapter_real_take, *value.shape[1:]
+            ).detach()
+
     adapter_info: Dict[str, torch.Tensor] = {}
     adapter_updated = False
-    adapter_objective = str(
-        cfg.get("feature_adapter_objective", "supcon")
-    ).lower().strip()
-    adapter_uses_generated = (
-        feature_adapter is not None
-        and adapter_objective == "gen_real_multipos_infonce"
-    )
     if adapter_uses_generated and cfg_uncond_split:
         raise ValueError(
-            "gen_real_multipos_infonce cannot use cfg_uncond_split because "
+            f"{adapter_objective} cannot use cfg_uncond_split because "
             "mixed-class negatives would be mislabeled as class positives"
         )
-    if adapter_uses_generated and bool(
+    if adapter_objective == "gen_real_multipos_infonce" and bool(
         cfg.get("feature_adapter_global_negatives", False)
     ):
         raise ValueError(
@@ -2414,13 +2846,14 @@ def train_step(
         with _amp_ctx(mae_use_bf16):
             need_generated_stage_features = (
                 feature_discriminator is not None
-                or (adapter_uses_generated and feature_adapter_update_allowed)
+                or (adapter_uses_generated and adapter_update_this_step)
             )
             activation_result = feature_extractor.get_activations(
                 gen_samples_local,
                 **act_kwargs,
                 stage_adapters=target_stage_adapters,
                 return_stage_features=need_generated_stage_features,
+                return_all_stage_features=need_all_adapter_stage_features,
             )
         if need_generated_stage_features:
             gen_feats_local, gen_stage_features_local = activation_result
@@ -2436,9 +2869,20 @@ def train_step(
             name: feature.detach()
             for name, feature in gen_stage_features.items()
         }
-        if adapter_uses_generated and feature_adapter_update_allowed
+        if adapter_uses_generated and adapter_update_this_step
         else None
     )
+    adapter_target_gen_features: Dict[str, torch.Tensor] = {}
+    if adapter_uses_raw_drift and adapter_update_this_step:
+        for name, value in gen_feats.items():
+            if _feature_stage_group(name) not in adapter_stage_names:
+                continue
+            selected = value.reshape(B, G, *value.shape[1:])[
+                :, :adapter_generated_take
+            ]
+            adapter_target_gen_features[name] = selected.reshape(
+                B * adapter_generated_take, *value.shape[1:]
+            ).detach()
     history_ratio = _historical_replay_ratio_for_step(cfg, step, active=H > 0)
     configured_current_weight = cfg.get("historical_gen_current_weight", None)
     if configured_current_weight is not None:
@@ -2761,14 +3205,11 @@ def train_step(
     # generated maps were detached before the generator backward, so this
     # backward cannot update either the generator or frozen MAE.
     if feature_adapter is not None:
-        update_frequency = int(cfg.get("feature_adapter_update_freq", 1))
-        if update_frequency <= 0:
-            raise ValueError("feature_adapter_update_freq must be positive")
-        if feature_adapter_update_allowed and step % update_frequency == 0:
+        if adapter_update_this_step:
             feature_adapter.train()
             feature_adapter_optimizer.zero_grad(set_to_none=True)
             with _amp_ctx(mae_use_bf16):
-                adapter_loss, adapter_info = feature_adapter(
+                adapter_output, adapter_info = feature_adapter(
                     real_stage_features,
                     labels,
                     batch_size=B,
@@ -2794,13 +3235,85 @@ def train_step(
                         cfg.get("feature_adapter_real_anchor_weight", 0.0)
                     ),
                 )
+            if adapter_uses_raw_drift:
+                adapted_real_maps, adapted_generated_maps = adapter_output
+                online_pos_adapter_feats = _adapter_activations_from_maps(
+                    adapted_real_maps,
+                    act_kwargs,
+                    fuse_stats=bool(feature_extractor.fuse_stats),
+                )
+                online_gen_adapter_feats = _adapter_activations_from_maps(
+                    adapted_generated_maps,
+                    act_kwargs,
+                    fuse_stats=bool(feature_extractor.fuse_stats),
+                )
+                adapter_loss, raw_drift_info = compute_adapter_raw_drift_snr_loss(
+                    online_gen_adapter_feats,
+                    online_pos_adapter_feats,
+                    adapter_target_gen_features,
+                    adapter_target_pos_features,
+                    batch_size=B,
+                    generated_count=adapter_generated_take,
+                    positive_count=adapter_real_take,
+                    query_count=int(
+                        cfg.get("feature_adapter_drift_query_count", 8)
+                    ),
+                    bank_count=int(
+                        cfg.get("feature_adapter_drift_bank_count", 12)
+                    ),
+                    partition_seed=(
+                        int(cfg.get("seed", 42))
+                        + 1_000_003 * int(step)
+                        + 7_919
+                    ),
+                    R_list=R_list,
+                    signal_weight=float(
+                        cfg.get("feature_adapter_loss_weight", 1.0)
+                    ),
+                    consistency_weight=float(
+                        cfg.get("feature_adapter_drift_consistency_weight", 1.0)
+                    ),
+                    variance_epsilon=float(
+                        cfg.get("feature_adapter_drift_variance_epsilon", 1.0e-8)
+                    ),
+                    cosine_epsilon=float(
+                        cfg.get("feature_adapter_drift_cosine_epsilon", 1.0e-8)
+                    ),
+                    global_scale_stats=bool(
+                        cfg.get("feature_adapter_drift_global_scale_stats", False)
+                    ),
+                    top_p=rev_drift_top_p,
+                    top_p_min_keep=drift_top_p_min_keep,
+                    top_k_pos=drift_top_k_pos,
+                    top_k_neg=drift_top_k_neg,
+                    affinity_kernel=rev_drift_affinity_kernel,
+                    kernel_shape=rev_drift_kernel_shape,
+                    kernel_mix_weight=rev_drift_kernel_mix_weight,
+                    kernel_temperature_mix=rev_drift_kernel_temperature_mix,
+                    kernel_temperature_mix_weights=(
+                        rev_drift_kernel_temperature_mix_weights
+                    ),
+                    feature_temperature_multipliers=(
+                        feature_temperature_multipliers
+                    ),
+                    feature_loss_weights=feature_loss_weights,
+                )
+                adapter_info.update(raw_drift_info)
+            else:
+                adapter_loss = adapter_output
             adapter_loss.backward()
+            adapter_max_grad_norm = float(
+                cfg.get("feature_adapter_max_grad_norm", 1.0)
+            )
             adapter_grad_norm = nn.utils.clip_grad_norm_(
                 feature_adapter.parameters(),
-                float(cfg.get("feature_adapter_max_grad_norm", 1.0)),
+                adapter_max_grad_norm,
             )
             feature_adapter_optimizer.step()
             adapter_info["adapter/grad_norm"] = adapter_grad_norm.detach()
+            adapter_info["adapter/grad_clipped"] = adapter_grad_norm.detach().gt(
+                adapter_max_grad_norm
+            ).float()
             adapter_info["adapter/real_samples_per_class"] = torch.tensor(
                 min(int(cfg.get("feature_adapter_samples_per_class", 8)), P),
                 device=device,
@@ -3283,6 +3796,37 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
         feature_adapter_target,
         feature_adapter_optimizer,
     ) = build_feature_adapter_system(mae, cfg, device, world_size)
+    if (
+        feature_adapter is not None
+        and str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
+        == "raw_drift_snr"
+    ):
+        raw_adapter = (
+            feature_adapter.module
+            if hasattr(feature_adapter, "module")
+            else feature_adapter
+        )
+        raw_group_weights = _resolve_feature_loss_group_weights(cfg)
+        raw_default_weight = float(raw_group_weights.get("default", 1.0))
+        inactive_adapter_stages = [
+            stage
+            for stage in raw_adapter.stages
+            if float(raw_group_weights.get(stage, raw_default_weight)) <= 0.0
+        ]
+        if inactive_adapter_stages:
+            raise ValueError(
+                "raw_drift_snr requires a positive feature-loss weight for "
+                f"every adapter stage; inactive={inactive_adapter_stages}"
+            )
+        if bool(cfg.get("stochastic_feature_stage_loss", False)):
+            raise ValueError(
+                "raw_drift_snr cannot use stochastic_feature_stage_loss with "
+                "DDP static_graph adapters"
+            )
+        if float(cfg.get("feature_adapter_reg_lambda", 0.0)) != 0.0:
+            raise ValueError(
+                "raw_drift_snr currently requires feature_adapter_reg_lambda=0"
+            )
     (
         feature_discriminator,
         feature_discriminator_optimizer,
@@ -3371,7 +3915,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     adapter_requires_distinct_real = bool(
         feature_adapter is not None
         and str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
-        == "gen_real_multipos_infonce"
+        in ("gen_real_multipos_infonce", "raw_drift_snr")
         and cfg.get("feature_adapter_require_distinct_real", False)
     )
     adapter_distinct_real_count = int(
@@ -3560,9 +4104,25 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 f"lr={float(cfg.get('feature_adapter_lr', 1.0e-4)):g} "
                 f"target_ema={float(cfg.get('feature_adapter_ema_decay', 0.999)):g} "
                 "direct_adapted_features="
-                f"{str(raw_adapter.objective == 'gen_real_multipos_infonce').lower()} "
+                f"{str(raw_adapter.objective in ('gen_real_multipos_infonce', 'raw_drift_snr')).lower()} "
                 f"parameters={trainable_parameters}"
             )
+            if raw_adapter.objective == "raw_drift_snr":
+                print(
+                    "[feature-adapter-raw-drift] "
+                    "field=pre_fnorm_standardized "
+                    f"query={int(cfg.get('feature_adapter_drift_query_count', 8))} "
+                    f"bank_a=bank_b={int(cfg.get('feature_adapter_drift_bank_count', 12))} "
+                    "negative_distribution=generated "
+                    "real_cfg_negatives=excluded "
+                    f"signal_weight={float(cfg.get('feature_adapter_loss_weight', 1.0)):g} "
+                    "consistency_weight="
+                    f"{float(cfg.get('feature_adapter_drift_consistency_weight', 1.0)):g} "
+                    f"variance_epsilon={float(cfg.get('feature_adapter_drift_variance_epsilon', 1.0e-8)):g} "
+                    f"update_freq={int(cfg.get('feature_adapter_update_freq', 1))} "
+                    "shared_scale=per_online_feature target_scale=per_ema_feature",
+                    flush=True,
+                )
         if feature_discriminator is None:
             print("[feature-gan] disabled")
         else:
@@ -3588,6 +4148,30 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     generated_per_step = (
         batch_size * world_size * int(cfg.get("gen_per_label", 64))
     )
+    adapter_freeze_step: Optional[int] = None
+    adapter_freeze_epochs_value = cfg.get(
+        "feature_adapter_freeze_after_generated_epochs", None
+    )
+    if feature_adapter is not None and adapter_freeze_epochs_value is not None:
+        adapter_freeze_epochs = float(adapter_freeze_epochs_value)
+        if not math.isfinite(adapter_freeze_epochs) or adapter_freeze_epochs <= 0.0:
+            raise ValueError(
+                "feature_adapter_freeze_after_generated_epochs must be finite "
+                "and positive"
+            )
+        adapter_freeze_step = _steps_for_generated_epochs(
+            dataset_size=generated_epoch_size,
+            generated_per_step=generated_per_step,
+            epochs=adapter_freeze_epochs,
+        )
+        if is_main_process(rank):
+            print(
+                "[feature-adapter] late freeze "
+                f"after_generated_epochs={adapter_freeze_epochs:g} "
+                f"freeze_step={adapter_freeze_step}; generator keeps the frozen "
+                "EMA metric thereafter",
+                flush=True,
+            )
     historical_replay_enabled = bool(cfg.get("historical_gen_replay", False))
     historical_replay_ratio = float(
         cfg.get("historical_gen_replay_ratio", 0.0)
@@ -4184,7 +4768,10 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
             feature_adapter=feature_adapter,
             feature_adapter_target=feature_adapter_target,
             feature_adapter_optimizer=feature_adapter_optimizer,
-            feature_adapter_update_allowed=adapter_real_bank_ready,
+            feature_adapter_update_allowed=(
+                adapter_real_bank_ready
+                and (adapter_freeze_step is None or step < adapter_freeze_step)
+            ),
             feature_discriminator=feature_discriminator,
             feature_discriminator_optimizer=feature_discriminator_optimizer,
             historical_samples=historical_smp,

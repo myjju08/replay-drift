@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+from drifting_core.imagenet_loss import raw_reverse_drift_fields
 from memory_bank import ArrayMemoryBank
 from models.feature_adapter import (
     FeatureAdapterSystem,
@@ -12,7 +13,8 @@ from models.feature_adapter import (
     supervised_contrastive_loss,
     update_adapter_ema,
 )
-from models.mae_resnet import MAEResNet
+from models.mae_resnet import MAEResNet, activations_from_feature_map
+from train_imagenet_gen import compute_adapter_raw_drift_snr_loss
 
 
 class FeatureAdapterTest(unittest.TestCase):
@@ -349,10 +351,136 @@ class FeatureAdapterTest(unittest.TestCase):
         )
         self.assertEqual(set(stage_features), {"layer3", "layer4"})
 
+        _, all_stage_features = mae.get_activations(
+            torch.randn(2, 4, 8, 8),
+            patch_mean_size=[2],
+            patch_std_size=[2],
+            use_mean=True,
+            use_std=True,
+            with_global=True,
+            every_k_block=1,
+            active_stages=["stage3", "stage4"],
+            return_stage_features=True,
+            return_all_stage_features=True,
+        )
+        self.assertEqual(
+            set(all_stage_features),
+            {"layer3", "layer3_blk1", "layer3_blk2", "layer4", "layer4_blk1", "layer4_blk2"},
+        )
+
         with self.assertRaisesRegex(ValueError, "Unknown active feature stages"):
             mae.get_activations(
                 torch.randn(1, 4, 8, 8), active_stages=["stage5"]
             )
+
+    def test_raw_reverse_field_is_pre_rms_and_differentiable(self):
+        torch.manual_seed(7)
+        query = torch.randn(2, 6, 5, requires_grad=True)
+        positive = (torch.randn(2, 4, 5) + 1.5).requires_grad_()
+        negative = torch.randn(2, 3, 5, requires_grad=True)
+        fields, scale = raw_reverse_drift_fields(
+            query,
+            positive,
+            negative,
+            R_list=(0.05, 0.2),
+        )
+        self.assertEqual(len(fields), 2)
+        self.assertTrue(torch.isfinite(scale))
+        energies = torch.stack([field.square().mean() for field in fields])
+        self.assertTrue(torch.isfinite(energies).all())
+        # A post-RMS-normalized force would have unit energy at every R.
+        self.assertGreater((energies - 1.0).abs().max().item(), 0.05)
+        energies.sum().backward()
+        for tensor in (query, positive, negative):
+            self.assertIsNotNone(tensor.grad)
+            self.assertTrue(torch.isfinite(tensor.grad).all())
+
+    def test_raw_drift_snr_updates_adapter_but_not_mae_or_generator_maps(self):
+        torch.manual_seed(11)
+        batch_size = 1
+        positive_count = 8
+        generated_count = 8
+        system = FeatureAdapterSystem(
+            {"stage3": 8},
+            ["stage3"],
+            bottleneck=4,
+            objective="raw_drift_snr",
+        )
+        real = torch.randn(
+            batch_size * positive_count, 8, 2, 2, requires_grad=True
+        )
+        generated = torch.randn(
+            batch_size * generated_count, 8, 2, 2, requires_grad=True
+        )
+        (online_real_maps, online_gen_maps), _ = system(
+            {"layer3": real},
+            torch.tensor([3]),
+            batch_size=batch_size,
+            positive_count=positive_count,
+            samples_per_class=positive_count,
+            temperature=0.1,
+            supcon_weight=1.0,
+            ce_weight=0.0,
+            reg_weight=0.0,
+            generated_stage_features={"layer3": generated},
+            generated_count=generated_count,
+            generated_samples_per_class=generated_count,
+        )
+        online_real = activations_from_feature_map(
+            "layer3",
+            online_real_maps["layer3"],
+            patch_mean_size=[],
+            patch_std_size=[],
+        )
+        online_generated = activations_from_feature_map(
+            "layer3",
+            online_gen_maps["layer3"],
+            patch_mean_size=[],
+            patch_std_size=[],
+        )
+        with torch.no_grad():
+            target_real = activations_from_feature_map(
+                "layer3", real.detach(), patch_mean_size=[], patch_std_size=[]
+            )
+            target_generated = activations_from_feature_map(
+                "layer3", generated.detach(), patch_mean_size=[], patch_std_size=[]
+            )
+        loss, metrics = compute_adapter_raw_drift_snr_loss(
+            online_generated,
+            online_real,
+            target_generated,
+            target_real,
+            batch_size=batch_size,
+            generated_count=generated_count,
+            positive_count=positive_count,
+            query_count=2,
+            bank_count=3,
+            partition_seed=17,
+            R_list=(0.2,),
+            signal_weight=1.0,
+            consistency_weight=1.0,
+            variance_epsilon=1.0e-8,
+            cosine_epsilon=1.0e-8,
+            global_scale_stats=False,
+            top_p=1.0,
+            top_p_min_keep=1,
+            top_k_pos=0,
+            top_k_neg=0,
+            affinity_kernel="exponential",
+            kernel_shape=1.0,
+            kernel_mix_weight=0.5,
+            kernel_temperature_mix=(),
+            kernel_temperature_mix_weights=(),
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("adapter/drift_snr", metrics)
+        self.assertIn("adapter/drift_consistency", metrics)
+        loss.backward()
+        self.assertIsNone(real.grad)
+        self.assertIsNone(generated.grad)
+        grad = system.adapters["stage3"].up.weight.grad
+        self.assertIsNotNone(grad)
+        self.assertTrue(torch.isfinite(grad).all())
 
 
 if __name__ == "__main__":

@@ -173,6 +173,7 @@ class FeatureAdapterSystem(nn.Module):
             "supcon",
             "supcon_ce",
             "gen_real_multipos_infonce",
+            "raw_drift_snr",
         ):
             raise ValueError(f"Unknown feature-adapter objective {objective!r}")
         self.adapters = nn.ModuleDict()
@@ -185,7 +186,10 @@ class FeatureAdapterSystem(nn.Module):
             self.adapters[stage] = ResidualSpatialAdapter(
                 channels, int(bottleneck), float(dropout)
             )
-            if self.objective == "gen_real_multipos_infonce":
+            if self.objective in (
+                "gen_real_multipos_infonce",
+                "raw_drift_snr",
+            ):
                 # Make the contrastive gradient act directly on the adapted
                 # MAE metric instead of letting an auxiliary projection head
                 # absorb the task while remaining invisible to drift loss.
@@ -222,6 +226,81 @@ class FeatureAdapterSystem(nn.Module):
         take = min(int(samples_per_class), int(positive_count))
         if take < 2:
             raise ValueError("feature adapter needs at least two positives per class")
+        if self.objective == "raw_drift_snr":
+            if generated_stage_features is None:
+                raise ValueError("raw_drift_snr requires generated stage features")
+            generated_take = min(
+                int(generated_samples_per_class), int(generated_count)
+            )
+            if take < 4 or generated_take < 4:
+                raise ValueError(
+                    "raw_drift_snr needs at least four real and generated "
+                    "samples per class for two non-trivial banks"
+                )
+            if take % 2 != 0 or generated_take % 2 != 0:
+                raise ValueError(
+                    "raw_drift_snr real/generated sample counts must be even"
+                )
+
+            adapted_real: Dict[str, torch.Tensor] = {}
+            adapted_generated: Dict[str, torch.Tensor] = {}
+            residuals: Dict[str, list[torch.Tensor]] = {
+                stage: [] for stage in self.stages
+            }
+            for name, raw_real in stage_features.items():
+                stage = None
+                for candidate in self.stages:
+                    layer = f"layer{candidate[-1]}"
+                    if name == layer or name.startswith(f"{layer}_"):
+                        stage = candidate
+                        break
+                if stage is None:
+                    continue
+                if name not in generated_stage_features:
+                    raise KeyError(
+                        f"MAE did not emit matching generated raw map {name}"
+                    )
+                raw_generated = generated_stage_features[name]
+                expected_real = batch_size * positive_count
+                expected_generated = batch_size * generated_count
+                if raw_real.shape[0] < expected_real:
+                    raise ValueError(
+                        f"{name} has {raw_real.shape[0]} real examples, "
+                        f"expected at least {expected_real}"
+                    )
+                if raw_generated.shape[0] < expected_generated:
+                    raise ValueError(
+                        f"{name} has {raw_generated.shape[0]} generated examples, "
+                        f"expected at least {expected_generated}"
+                    )
+                real = raw_real.detach()[:expected_real].reshape(
+                    batch_size, positive_count, *raw_real.shape[1:]
+                )[:, :take]
+                generated = raw_generated.detach()[:expected_generated].reshape(
+                    batch_size, generated_count, *raw_generated.shape[1:]
+                )[:, :generated_take]
+                real = real.reshape(-1, *real.shape[2:])
+                generated = generated.reshape(-1, *generated.shape[2:])
+                combined = torch.cat([real, generated], dim=0)
+                adapted = self.adapters[stage](combined)
+                adapted_real[name] = adapted[: real.shape[0]]
+                adapted_generated[name] = adapted[real.shape[0] :]
+                with torch.no_grad():
+                    residuals[stage].append(
+                        (adapted.float() - combined.float()).square().mean()
+                        / combined.float().square().mean().clamp_min(1.0e-6)
+                    )
+
+            if not adapted_real:
+                raise ValueError("raw_drift_snr received no selected stage maps")
+            metrics: Dict[str, torch.Tensor] = {}
+            for stage, values in residuals.items():
+                if values:
+                    metrics[f"adapter/{stage}_residual_ratio"] = torch.stack(
+                        values
+                    ).mean()
+            return (adapted_real, adapted_generated), metrics
+
         repeated_labels = labels[:, None].expand(batch_size, take).reshape(-1)
         use_generated = self.objective == "gen_real_multipos_infonce"
         generated_take = 0
