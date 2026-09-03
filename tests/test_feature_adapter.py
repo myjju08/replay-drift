@@ -109,6 +109,72 @@ class FeatureAdapterTest(unittest.TestCase):
         ).mean()
         torch.testing.assert_close(loss, expected)
 
+    def test_rectangular_infonce_excludes_only_real_anchor_self_pairs(self):
+        real = torch.tensor(
+            [[1.0, 0.0], [0.8, 0.2], [0.0, 1.0], [0.2, 0.8]]
+        )
+        real_labels = torch.tensor([0, 0, 1, 1])
+        generated = torch.tensor([[0.9, 0.1], [0.1, 0.9]])
+        generated_labels = torch.tensor([0, 1])
+        candidates = torch.cat([real, generated], dim=0)
+        candidate_labels = torch.cat([real_labels, generated_labels], dim=0)
+        temperature = 0.2
+
+        loss = multi_positive_info_nce_loss(
+            real,
+            real_labels,
+            candidates,
+            candidate_labels,
+            temperature,
+            exclude_matching_indices=True,
+        )
+
+        logits = torch.nn.functional.normalize(real, dim=-1) @ (
+            torch.nn.functional.normalize(candidates, dim=-1).t()
+        )
+        logits = logits / temperature
+        valid = torch.ones_like(logits, dtype=torch.bool)
+        matching = torch.arange(real.shape[0])
+        valid[matching, matching] = False
+        positive = real_labels[:, None].eq(candidate_labels[None, :]) & valid
+        self.assertTrue(torch.equal(positive.sum(dim=1), torch.full((4,), 2)))
+        log_prob = logits - torch.logsumexp(
+            logits.masked_fill(~valid, float("-inf")), dim=1, keepdim=True
+        )
+        expected = -(
+            log_prob.masked_fill(~positive, 0.0).sum(dim=1)
+            / positive.sum(dim=1)
+        ).mean()
+        torch.testing.assert_close(loss, expected)
+
+    def test_different_class_generated_candidate_stays_in_normalizer(self):
+        anchor = torch.tensor([[1.0, 0.0]])
+        anchor_labels = torch.tensor([0])
+        real_prefix_and_positive = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+        candidate_labels = torch.tensor([0, 0, 1])
+
+        easy_negative_loss = multi_positive_info_nce_loss(
+            anchor,
+            anchor_labels,
+            torch.cat(
+                [real_prefix_and_positive, torch.tensor([[-1.0, 0.0]])], dim=0
+            ),
+            candidate_labels,
+            temperature=0.1,
+            exclude_matching_indices=True,
+        )
+        hard_negative_loss = multi_positive_info_nce_loss(
+            anchor,
+            anchor_labels,
+            torch.cat(
+                [real_prefix_and_positive, torch.tensor([[1.0, 0.0]])], dim=0
+            ),
+            candidate_labels,
+            temperature=0.1,
+            exclude_matching_indices=True,
+        )
+        self.assertGreater(hard_negative_loss.item(), easy_negative_loss.item())
+
     def test_generated_real_infonce_detaches_inputs_and_updates_adapter_only(self):
         system = FeatureAdapterSystem(
             {"stage3": 8},
@@ -155,6 +221,111 @@ class FeatureAdapterTest(unittest.TestCase):
         self.assertTrue(
             torch.isfinite(system.adapters["stage3"].up.weight.grad).all()
         )
+
+    def test_real_anchor_infonce_uses_same_class_generated_as_positives(self):
+        system = FeatureAdapterSystem(
+            {"stage3": 8},
+            ["stage3"],
+            bottleneck=4,
+            projection_dim=6,
+            objective="real_anchor_multipos_infonce",
+        )
+        self.assertIsInstance(system.projectors["stage3"], torch.nn.Identity)
+        real = torch.randn(4 * 32, 8, 1, 1, requires_grad=True)
+        generated = torch.randn(4 * 32, 8, 1, 1, requires_grad=True)
+        labels = torch.tensor([10, 20, 30, 40])
+        loss, metrics = system(
+            {"layer3": real},
+            labels,
+            batch_size=4,
+            positive_count=32,
+            samples_per_class=32,
+            temperature=0.1,
+            supcon_weight=1.0,
+            ce_weight=0.0,
+            reg_weight=0.0,
+            generated_stage_features={"layer3": generated},
+            generated_count=32,
+            generated_samples_per_class=32,
+            generated_anchor_weight=0.0,
+            real_anchor_weight=1.0,
+        )
+
+        real_embeddings = real.detach().squeeze(-1).squeeze(-1)
+        generated_embeddings = generated.detach().squeeze(-1).squeeze(-1)
+        repeated_labels = labels[:, None].expand(4, 32).reshape(-1)
+        expected = multi_positive_info_nce_loss(
+            real_embeddings,
+            repeated_labels,
+            torch.cat([real_embeddings, generated_embeddings], dim=0),
+            torch.cat([repeated_labels, repeated_labels], dim=0),
+            temperature=0.1,
+            exclude_matching_indices=True,
+        )
+        torch.testing.assert_close(loss, expected)
+        self.assertEqual(
+            metrics["adapter/stage3_real_positives_per_anchor"].item(), 31.0
+        )
+        self.assertEqual(
+            metrics["adapter/stage3_generated_positives_per_anchor"].item(), 32.0
+        )
+        self.assertEqual(
+            metrics["adapter/stage3_positives_per_anchor"].item(), 63.0
+        )
+        self.assertEqual(
+            metrics["adapter/stage3_real_negatives_per_anchor"].item(), 96.0
+        )
+        self.assertEqual(
+            metrics["adapter/stage3_generated_negatives_per_anchor"].item(),
+            96.0,
+        )
+        self.assertEqual(
+            metrics["adapter/stage3_negatives_per_anchor"].item(), 192.0
+        )
+        self.assertEqual(
+            metrics["adapter/stage3_candidate_count"].item(), 256.0
+        )
+        self.assertEqual(
+            metrics["adapter/stage3_valid_candidates_per_anchor"].item(), 255.0
+        )
+        self.assertNotIn("adapter/stage3_gen_to_real_infonce", metrics)
+
+        loss.backward()
+        self.assertIsNone(real.grad)
+        self.assertIsNone(generated.grad)
+        self.assertIsNotNone(system.adapters["stage3"].up.weight.grad)
+        self.assertTrue(
+            torch.isfinite(system.adapters["stage3"].up.weight.grad).all()
+        )
+
+    def test_real_anchor_infonce_rejects_misleading_anchor_weights(self):
+        system = FeatureAdapterSystem(
+            {"stage3": 8},
+            ["stage3"],
+            bottleneck=4,
+            objective="real_anchor_multipos_infonce",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "fixes generated_anchor_weight=0"
+        ):
+            system(
+                {"layer3": torch.randn(6, 8, 1, 1)},
+                torch.tensor([1, 2]),
+                batch_size=2,
+                positive_count=3,
+                samples_per_class=3,
+                temperature=0.1,
+                supcon_weight=1.0,
+                ce_weight=0.0,
+                reg_weight=0.0,
+                generated_stage_features={
+                    "layer3": torch.randn(4, 8, 1, 1)
+                },
+                generated_count=2,
+                generated_samples_per_class=2,
+                generated_anchor_weight=1.0,
+                real_anchor_weight=0.0,
+            )
 
     def test_alternating_step_preserves_generator_grad_and_hard_copies_target(self):
         online = FeatureAdapterSystem(

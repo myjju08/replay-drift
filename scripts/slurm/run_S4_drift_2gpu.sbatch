@@ -110,6 +110,19 @@ if bool(cfg.get("feature_adapter", False)):
             "feature_adapter_weight_decay": 0.0,
             "feature_adapter_ema_decay": 0.0,
         }
+    elif objective == "real_anchor_multipos_infonce":
+        adapter_expected = {
+            "feature_adapter_objective": "real_anchor_multipos_infonce",
+            "feature_adapter_samples_per_class": 32,
+            "feature_adapter_generated_samples_per_class": 32,
+            "feature_adapter_generated_anchor_weight": 0.0,
+            "feature_adapter_real_anchor_weight": 1.0,
+            "feature_adapter_global_negatives": False,
+            "feature_adapter_require_distinct_real": True,
+            "feature_adapter_reg_lambda": 0.0,
+            "feature_adapter_weight_decay": 0.0,
+            "feature_adapter_ema_decay": 0.0,
+        }
     elif objective == "raw_drift_snr":
         adapter_expected = {
             "feature_adapter_objective": "raw_drift_snr",

@@ -86,8 +86,9 @@ def multi_positive_info_nce_loss(
     and every valid candidate participates in the denominator.  The loss is
     the mean negative log-probability over the positive candidates, matching
     the supervised-contrastive multi-positive form.  ``exclude_matching_indices``
-    removes the diagonal for real-to-real training while generated-to-real
-    training leaves every real candidate valid.
+    removes the same-index candidate for every anchor. Candidates must begin
+    with the embeddings corresponding to the anchors; extra candidates may
+    follow that prefix.
     """
     if anchor_embeddings.ndim != 2:
         raise ValueError(
@@ -120,14 +121,13 @@ def multi_positive_info_nce_loss(
     logits = (anchors @ candidates.transpose(0, 1)) / float(temperature)
     valid = torch.ones_like(logits, dtype=torch.bool)
     if exclude_matching_indices:
-        if anchor_embeddings.shape[0] != candidate_embeddings.shape[0]:
+        if anchor_embeddings.shape[0] > candidate_embeddings.shape[0]:
             raise ValueError(
-                "exclude_matching_indices requires equally sized anchor and "
-                "candidate batches"
+                "exclude_matching_indices requires a candidate prefix at least "
+                "as long as the anchor batch"
             )
-        valid &= ~torch.eye(
-            logits.shape[0], dtype=torch.bool, device=logits.device
-        )
+        matching = torch.arange(logits.shape[0], device=logits.device)
+        valid[matching, matching] = False
     if bool((valid.sum(dim=1) == 0).any()):
         raise ValueError("every InfoNCE anchor must have a valid candidate")
 
@@ -172,6 +172,7 @@ class FeatureAdapterSystem(nn.Module):
         if self.objective not in (
             "supcon",
             "supcon_ce",
+            "real_anchor_multipos_infonce",
             "gen_real_multipos_infonce",
             "raw_drift_snr",
         ):
@@ -187,6 +188,7 @@ class FeatureAdapterSystem(nn.Module):
                 channels, int(bottleneck), float(dropout)
             )
             if self.objective in (
+                "real_anchor_multipos_infonce",
                 "gen_real_multipos_infonce",
                 "raw_drift_snr",
             ):
@@ -302,13 +304,16 @@ class FeatureAdapterSystem(nn.Module):
             return (adapted_real, adapted_generated), metrics
 
         repeated_labels = labels[:, None].expand(batch_size, take).reshape(-1)
-        use_generated = self.objective == "gen_real_multipos_infonce"
+        use_generated = self.objective in (
+            "real_anchor_multipos_infonce",
+            "gen_real_multipos_infonce",
+        )
         generated_take = 0
         generated_labels: Optional[torch.Tensor] = None
         if use_generated:
             if generated_stage_features is None:
                 raise ValueError(
-                    "gen_real_multipos_infonce requires generated stage features"
+                    f"{self.objective} requires generated stage features"
                 )
             generated_take = min(
                 int(generated_samples_per_class), int(generated_count)
@@ -323,6 +328,14 @@ class FeatureAdapterSystem(nn.Module):
                 raise ValueError("real_anchor_weight must be non-negative")
             if float(generated_anchor_weight) + float(real_anchor_weight) <= 0.0:
                 raise ValueError("at least one adapter anchor weight must be positive")
+            if self.objective == "real_anchor_multipos_infonce" and (
+                float(generated_anchor_weight) != 0.0
+                or float(real_anchor_weight) != 1.0
+            ):
+                raise ValueError(
+                    "real_anchor_multipos_infonce fixes generated_anchor_weight=0 "
+                    "and real_anchor_weight=1"
+                )
             generated_labels = labels[:, None].expand(
                 batch_size, generated_take
             ).reshape(-1)
@@ -391,31 +404,47 @@ class FeatureAdapterSystem(nn.Module):
                 adapted_generated = self.adapters[stage](generated_feature)
                 pooled_generated = adapted_generated.float().mean(dim=(2, 3))
                 projected_generated = self.projectors[stage](pooled_generated)
-                generated_to_real = multi_positive_info_nce_loss(
-                    projected_generated,
-                    generated_labels,
-                    projected_real,
-                    repeated_labels,
-                    temperature,
-                )
-                if float(real_anchor_weight) > 0.0:
-                    real_to_real = multi_positive_info_nce_loss(
+                if self.objective == "real_anchor_multipos_infonce":
+                    combined_candidates = torch.cat(
+                        [projected_real, projected_generated], dim=0
+                    )
+                    combined_candidate_labels = torch.cat(
+                        [repeated_labels, generated_labels], dim=0
+                    )
+                    contrastive = multi_positive_info_nce_loss(
                         projected_real,
                         repeated_labels,
-                        projected_real,
-                        repeated_labels,
+                        combined_candidates,
+                        combined_candidate_labels,
                         temperature,
                         exclude_matching_indices=True,
                     )
                 else:
-                    real_to_real = generated_to_real.new_zeros(())
-                anchor_weight_sum = (
-                    float(generated_anchor_weight) + float(real_anchor_weight)
-                )
-                contrastive = (
-                    float(generated_anchor_weight) * generated_to_real
-                    + float(real_anchor_weight) * real_to_real
-                ) / anchor_weight_sum
+                    generated_to_real = multi_positive_info_nce_loss(
+                        projected_generated,
+                        generated_labels,
+                        projected_real,
+                        repeated_labels,
+                        temperature,
+                    )
+                    if float(real_anchor_weight) > 0.0:
+                        real_to_real = multi_positive_info_nce_loss(
+                            projected_real,
+                            repeated_labels,
+                            projected_real,
+                            repeated_labels,
+                            temperature,
+                            exclude_matching_indices=True,
+                        )
+                    else:
+                        real_to_real = generated_to_real.new_zeros(())
+                    anchor_weight_sum = (
+                        float(generated_anchor_weight) + float(real_anchor_weight)
+                    )
+                    contrastive = (
+                        float(generated_anchor_weight) * generated_to_real
+                        + float(real_anchor_weight) * real_to_real
+                    ) / anchor_weight_sum
                 residual_context = (
                     torch.enable_grad()
                     if float(reg_weight) > 0.0
@@ -436,40 +465,129 @@ class FeatureAdapterSystem(nn.Module):
                     real_residual_ratio + generated_residual_ratio
                 )
                 metrics[
-                    f"adapter/{stage}_gen_to_real_infonce"
-                ] = generated_to_real.detach()
-                metrics[
-                    f"adapter/{stage}_real_to_real_infonce"
-                ] = real_to_real.detach()
-                metrics[
                     f"adapter/{stage}_generated_residual_ratio"
                 ] = generated_residual_ratio.detach()
                 metrics[f"adapter/{stage}_infonce"] = contrastive.detach()
-                with torch.no_grad():
-                    normalized_generated = F.normalize(
-                        projected_generated.float(), dim=-1
-                    )
-                    normalized_real = F.normalize(projected_real.float(), dim=-1)
-                    cosine = normalized_generated @ normalized_real.transpose(0, 1)
-                    positive_pairs = generated_labels[:, None].eq(
-                        repeated_labels[None, :]
-                    )
-                    metrics[f"adapter/{stage}_positive_cosine"] = cosine[
-                        positive_pairs
-                    ].mean()
-                    negative_cosines = cosine[~positive_pairs]
-                    metrics[f"adapter/{stage}_negative_cosine"] = (
-                        negative_cosines.mean()
-                        if negative_cosines.numel() > 0
-                        else cosine.new_zeros(())
-                    )
-                    positives_per_anchor = positive_pairs.sum(dim=1).float()
-                    metrics[f"adapter/{stage}_positives_per_anchor"] = (
-                        positives_per_anchor.mean()
-                    )
-                    metrics[f"adapter/{stage}_real_candidate_count"] = (
-                        cosine.new_tensor(float(projected_real.shape[0]))
-                    )
+                if self.objective == "real_anchor_multipos_infonce":
+                    metrics[
+                        f"adapter/{stage}_real_anchor_infonce"
+                    ] = contrastive.detach()
+                    with torch.no_grad():
+                        normalized_real = F.normalize(
+                            projected_real.float(), dim=-1
+                        )
+                        normalized_generated = F.normalize(
+                            projected_generated.float(), dim=-1
+                        )
+                        normalized_candidates = torch.cat(
+                            [normalized_real, normalized_generated], dim=0
+                        )
+                        candidate_labels = torch.cat(
+                            [repeated_labels, generated_labels], dim=0
+                        )
+                        cosine = normalized_real @ normalized_candidates.transpose(
+                            0, 1
+                        )
+                        valid_pairs = torch.ones_like(cosine, dtype=torch.bool)
+                        matching = torch.arange(
+                            normalized_real.shape[0], device=cosine.device
+                        )
+                        valid_pairs[matching, matching] = False
+                        positive_pairs = (
+                            repeated_labels[:, None].eq(candidate_labels[None, :])
+                            & valid_pairs
+                        )
+                        negative_pairs = (
+                            repeated_labels[:, None].ne(candidate_labels[None, :])
+                            & valid_pairs
+                        )
+                        generated_columns = torch.arange(
+                            candidate_labels.shape[0], device=cosine.device
+                        ).ge(normalized_real.shape[0])
+                        generated_positive_pairs = (
+                            positive_pairs & generated_columns[None, :]
+                        )
+                        real_positive_pairs = (
+                            positive_pairs & ~generated_columns[None, :]
+                        )
+                        generated_negative_pairs = (
+                            negative_pairs & generated_columns[None, :]
+                        )
+                        real_negative_pairs = (
+                            negative_pairs & ~generated_columns[None, :]
+                        )
+                        metrics[f"adapter/{stage}_positive_cosine"] = cosine[
+                            positive_pairs
+                        ].mean()
+                        metrics[
+                            f"adapter/{stage}_same_class_generated_cosine"
+                        ] = cosine[generated_positive_pairs].mean()
+                        negative_cosines = cosine[negative_pairs]
+                        metrics[f"adapter/{stage}_negative_cosine"] = (
+                            negative_cosines.mean()
+                            if negative_cosines.numel() > 0
+                            else cosine.new_zeros(())
+                        )
+                        metrics[f"adapter/{stage}_positives_per_anchor"] = (
+                            positive_pairs.sum(dim=1).float().mean()
+                        )
+                        metrics[
+                            f"adapter/{stage}_real_positives_per_anchor"
+                        ] = real_positive_pairs.sum(dim=1).float().mean()
+                        metrics[
+                            f"adapter/{stage}_generated_positives_per_anchor"
+                        ] = generated_positive_pairs.sum(dim=1).float().mean()
+                        metrics[f"adapter/{stage}_negatives_per_anchor"] = (
+                            negative_pairs.sum(dim=1).float().mean()
+                        )
+                        metrics[
+                            f"adapter/{stage}_real_negatives_per_anchor"
+                        ] = real_negative_pairs.sum(dim=1).float().mean()
+                        metrics[
+                            f"adapter/{stage}_generated_negatives_per_anchor"
+                        ] = generated_negative_pairs.sum(dim=1).float().mean()
+                        metrics[f"adapter/{stage}_candidate_count"] = (
+                            cosine.new_tensor(float(candidate_labels.shape[0]))
+                        )
+                        metrics[
+                            f"adapter/{stage}_valid_candidates_per_anchor"
+                        ] = cosine.new_tensor(float(candidate_labels.shape[0] - 1))
+                else:
+                    metrics[
+                        f"adapter/{stage}_gen_to_real_infonce"
+                    ] = generated_to_real.detach()
+                    metrics[
+                        f"adapter/{stage}_real_to_real_infonce"
+                    ] = real_to_real.detach()
+                    with torch.no_grad():
+                        normalized_generated = F.normalize(
+                            projected_generated.float(), dim=-1
+                        )
+                        normalized_real = F.normalize(
+                            projected_real.float(), dim=-1
+                        )
+                        cosine = normalized_generated @ normalized_real.transpose(
+                            0, 1
+                        )
+                        positive_pairs = generated_labels[:, None].eq(
+                            repeated_labels[None, :]
+                        )
+                        metrics[f"adapter/{stage}_positive_cosine"] = cosine[
+                            positive_pairs
+                        ].mean()
+                        negative_cosines = cosine[~positive_pairs]
+                        metrics[f"adapter/{stage}_negative_cosine"] = (
+                            negative_cosines.mean()
+                            if negative_cosines.numel() > 0
+                            else cosine.new_zeros(())
+                        )
+                        positives_per_anchor = positive_pairs.sum(dim=1).float()
+                        metrics[f"adapter/{stage}_positives_per_anchor"] = (
+                            positives_per_anchor.mean()
+                        )
+                        metrics[f"adapter/{stage}_real_candidate_count"] = (
+                            cosine.new_tensor(float(projected_real.shape[0]))
+                        )
             else:
                 contrastive = supervised_contrastive_loss(
                     projected_real, repeated_labels, temperature

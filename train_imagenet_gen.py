@@ -1449,12 +1449,14 @@ def build_feature_adapter_system(
     if objective not in (
         "supcon",
         "supcon_ce",
+        "real_anchor_multipos_infonce",
         "gen_real_multipos_infonce",
         "raw_drift_snr",
     ):
         raise ValueError(
-            "feature_adapter_objective must be 'supcon', 'supcon_ce', or "
-            "'gen_real_multipos_infonce', or 'raw_drift_snr', "
+            "feature_adapter_objective must be 'supcon', 'supcon_ce', "
+            "'real_anchor_multipos_infonce', 'gen_real_multipos_infonce', or "
+            "'raw_drift_snr', "
             f"got {objective!r}"
         )
     stages = canonical_adapter_stages(
@@ -2407,7 +2409,11 @@ def train_step(
     adapter_uses_generated = bool(
         feature_adapter is not None
         and adapter_objective
-        in ("gen_real_multipos_infonce", "raw_drift_snr")
+        in (
+            "real_anchor_multipos_infonce",
+            "gen_real_multipos_infonce",
+            "raw_drift_snr",
+        )
     )
     adapter_uses_raw_drift = bool(
         feature_adapter is not None and adapter_objective == "raw_drift_snr"
@@ -2768,7 +2774,10 @@ def train_step(
             f"{adapter_objective} cannot use cfg_uncond_split because "
             "mixed-class negatives would be mislabeled as class positives"
         )
-    if adapter_objective == "gen_real_multipos_infonce" and bool(
+    if adapter_objective in (
+        "real_anchor_multipos_infonce",
+        "gen_real_multipos_infonce",
+    ) and bool(
         cfg.get("feature_adapter_global_negatives", False)
     ):
         raise ValueError(
@@ -3915,7 +3924,11 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
     adapter_requires_distinct_real = bool(
         feature_adapter is not None
         and str(cfg.get("feature_adapter_objective", "supcon")).lower().strip()
-        in ("gen_real_multipos_infonce", "raw_drift_snr")
+        in (
+            "real_anchor_multipos_infonce",
+            "gen_real_multipos_infonce",
+            "raw_drift_snr",
+        )
         and cfg.get("feature_adapter_require_distinct_real", False)
     )
     adapter_distinct_real_count = int(
@@ -4104,7 +4117,7 @@ def train_gen(cfg: dict, workdir: str, rank: int, world_size: int, device: torch
                 f"lr={float(cfg.get('feature_adapter_lr', 1.0e-4)):g} "
                 f"target_ema={float(cfg.get('feature_adapter_ema_decay', 0.999)):g} "
                 "direct_adapted_features="
-                f"{str(raw_adapter.objective in ('gen_real_multipos_infonce', 'raw_drift_snr')).lower()} "
+                f"{str(raw_adapter.objective in ('real_anchor_multipos_infonce', 'gen_real_multipos_infonce', 'raw_drift_snr')).lower()} "
                 f"parameters={trainable_parameters}"
             )
             if raw_adapter.objective == "raw_drift_snr":
